@@ -1,3 +1,5 @@
+// tracker_inmemory_journal.cpp
+// Same as your original tracker but with an in-memory journal (no file)
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -21,9 +23,6 @@
 #include <vector>
 
 using namespace std;
-
-// ---------------- constants / files ----------------
-const string JOURNAL_FILE = "sync_journal.log";
 
 // ---------------- basic types ----------------
 struct Group
@@ -57,9 +56,14 @@ mutex sessions_mtx;
 vector<int> peer_fds; // connected peer sockets for outgoing broadcast (not heavily used here)
 mutex peer_fds_mtx;
 
+// ---------------- in-memory journal (no file) ----------------
 // keep an in-memory set of journal lines to dedupe
 unordered_set<string> journal_lines_set;
 mutex journal_set_mtx;
+
+// ordered in-memory journal lines (persist only in RAM)
+vector<string> journal_lines;
+mutex journal_lines_mtx;
 
 // ---------------- socket helpers ----------------
 
@@ -142,72 +146,46 @@ void cleanup_fd(int fd)
     sessions.erase(fd);
 }
 
-// ---------------- journal helpers ----------------
-// Append a line to the journal file if not already present
+// ---------------- journal helpers (in-memory) ----------------
+// Append a line to the in-memory journal if not already present
 bool append_journal_line_if_new(const string &line)
 {
     lock_guard<mutex> lg(journal_set_mtx);
     if (journal_lines_set.count(line))
         return true; // already present
-    ofstream out(JOURNAL_FILE, ios::app);
-    if (!out.is_open())
+
+    // add to ordered vector
     {
-        cerr << "[journal] error opening journal for append\n";
-        return false;
+        lock_guard<mutex> lg2(journal_lines_mtx);
+        journal_lines.push_back(line);
     }
-    out << line << "\n";
-    out.close();
     journal_lines_set.insert(line);
+    cerr << "[journal] appended: " << line << "\n";
     return true;
 }
 
-// Load all lines from journal file into journal_lines_set (idempotent)
+// Initialize in-memory journal (no file). This is idempotent.
 void load_journal_into_set()
 {
     lock_guard<mutex> lg(journal_set_mtx);
     journal_lines_set.clear();
-    ifstream in(JOURNAL_FILE);
-    if (!in.is_open())
-        return;
-    string line;
-    while (getline(in, line))
-    {
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (!line.empty())
-            journal_lines_set.insert(line);
-    }
-    in.close();
+    lock_guard<mutex> lg2(journal_lines_mtx);
+    journal_lines.clear();
+    // Nothing to load from disk — purely in-memory journal.
 }
 
-// Read all journal lines into a vector (in file order)
+// Read all journal lines into a vector (in order)
 vector<string> read_journal_lines()
 {
-    vector<string> out;
-    ifstream in(JOURNAL_FILE);
-    if (!in.is_open())
-        return out;
-    string line;
-    while (getline(in, line))
-    {
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (!line.empty())
-            out.push_back(line);
-    }
-    in.close();
-    return out;
+    lock_guard<mutex> lg(journal_lines_mtx);
+    return journal_lines; // copy
 }
 
 // ---------------- apply functions (idempotent) ----------------
-// Each mutating operation appends a corresponding SYNC line to the journal (persist)
-// and applies locally. The sync lines are plain text commands in underscore format.
-// When lines come over from a peer, we call these apply_... functions with from_sync=true
-// to avoid rebroadcasting them again.
-
+// Forward-declare apply_ functions used by sync parsing
 string apply_create_user(const string &uid, const string &pwd, bool from_sync);
-
-// other apply stubs (create_group, accept_request, upload_file etc.) defined below
+string apply_create_group(const string &gid, const string &owner, bool from_sync);
+string apply_accept_request(const string &gid, const string &uid, const string &owner, bool from_sync);
 
 // ---------------- per-command handlers (client-originated) ----------------
 void handle_create_user(int fd, const vector<string> &args)
@@ -273,9 +251,6 @@ void handle_login(int fd, const vector<string> &args)
 }
 
 // create_group
-void handle_create_group(int fd, const vector<string> &args);
-string apply_create_group(const string &gid, const string &owner, bool from_sync);
-
 void handle_create_group(int fd, const vector<string> &args)
 {
     if (args.size() < 2)
@@ -414,9 +389,6 @@ void handle_list_requests(int fd, const vector<string> &args)
 }
 
 // accept_request (owner accepts; causes state change - sync)
-void handle_accept_request(int fd, const vector<string> &args);
-string apply_accept_request(const string &gid, const string &uid, const string &owner, bool from_sync);
-
 void handle_accept_request(int fd, const vector<string> &args)
 {
     if (args.size() < 3)
@@ -510,6 +482,8 @@ void handle_upload_file(int fd, const vector<string> &args)
         group_files[gid].push_back(m);
     }
     // journal the upload action
+    // NOTE: if path contains spaces, tokenization on the receiver may split it.
+    // Consider encoding the path (e.g. base64) for production — keeping simple here.
     string line = "SYNC_UPLOAD_FILE " + gid + " " + cur + " " + fname + " " + path;
     append_journal_line_if_new(line);
     lock_guard<mutex> lg(peer_fds_mtx);
@@ -705,8 +679,6 @@ void handle_sync_line(const string &line)
     // dedupe and persist locally
     if (!append_journal_line_if_new(line))
     {
-        // failed to persist; still attempt to apply to keep state consistent in-memory
-        // but warn
         cerr << "[sync] warning: failed to append journal line: " << line << "\n";
     }
     // parse & apply (call apply_* with from_sync=true)
@@ -734,7 +706,6 @@ void handle_sync_line(const string &line)
         if (toks.size() >= 5)
         {
             string gid = toks[1], owner = toks[2], fname = toks[3], path = toks[4];
-            // apply upload: add FileMeta if not already present
             lock_guard<mutex> lg(group_files_mtx);
             auto &vec = group_files[gid];
             bool found = false;
@@ -792,7 +763,7 @@ void sync_reader_thread(int pfd)
 }
 
 // ---------------- flush local journal to peer fd ----------------
-// Send all local journal lines (file order) to the connected peer.
+// Send all local journal lines (in-memory order) to the connected peer.
 // If send fails, we return false.
 bool flush_journal_to_fd(int pfd)
 {
@@ -912,9 +883,9 @@ int main(int argc, char **argv)
     if (argc >= 3)
         peer_addr = argv[2];
 
-    // load journal into memory set so we know what we've already persisted
+    // init in-memory journal
     load_journal_into_set();
-    cerr << "[sync] loaded " << journal_lines_set.size() << " journal lines\n";
+    cerr << "[sync] in-memory journal initialized (" << journal_lines_set.size() << " entries)\n";
 
     if (!peer_addr.empty())
     {
@@ -950,9 +921,7 @@ int main(int argc, char **argv)
 
     cout << "Tracker listening on port " << port << "\n";
 
-    // Accept inbound connections (clients or peers). A peer that connects will send SYNC_INIT
-    // as first line; we treat any incoming connection as generic and the sync reader thread
-    // will manage SYNC lines if a peer is connected from the other side.
+    // Accept inbound connections (clients or peers)
     while (true)
     {
         sockaddr_in peer{};
@@ -987,11 +956,6 @@ int main(int argc, char **argv)
         }
         else
         {
-            // otherwise treat it as a client command (process the first line then continue)
-            // spawn a thread to handle the client; the thread will continue reading further lines
-            // but we must process the firstline now: we will push it into the client's recv loop by
-            // handling it before starting the normal client handler thread.
-            // To keep code simple, spawn a thread that first processes the firstline then continues.
             auto client_thread_func = [client_fd, firstline]()
             {
                 // process first line
