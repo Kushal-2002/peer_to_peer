@@ -1,6 +1,3 @@
-// tracker_inmemory_journal.cpp
-// Same as your original tracker but with an in-memory journal (no file)
-
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -147,6 +144,7 @@ void cleanup_fd(int fd)
 }
 
 // ---------------- journal helpers (in-memory) ----------------
+
 // Append a line to the in-memory journal if not already present
 bool append_journal_line_if_new(const string &line)
 {
@@ -182,6 +180,7 @@ vector<string> read_journal_lines()
 }
 
 // ---------------- apply functions (idempotent) ----------------
+
 // Forward-declare apply_ functions used by sync parsing
 string apply_create_user(const string &uid, const string &pwd, bool from_sync);
 string apply_create_group(const string &gid, const string &owner, bool from_sync);
@@ -293,6 +292,8 @@ string apply_create_group(const string &gid, const string &owner, bool from_sync
     return "OK group_created";
 }
 
+string apply_join_request(const string &gid, const string &uid, bool from_sync);
+
 // join_group (client request only; owner accepts separately)
 void handle_join_group(int fd, const vector<string> &args)
 {
@@ -308,28 +309,44 @@ void handle_join_group(int fd, const vector<string> &args)
         send_line(fd, "ERR login_required");
         return;
     }
+    // delegate to apply_join_request which handles both local and sync cases
+    string res = apply_join_request(gid, cur, /*from_sync=*/false);
+    send_line(fd, res);
+}
+
+string apply_join_request(const string &gid, const string &uid, bool from_sync)
+{
+    if (gid.empty() || uid.empty())
+        return "ERR missing_args";
+
     lock_guard<mutex> lg(groups_mtx);
     auto it = groups.find(gid);
     if (it == groups.end())
     {
-        send_line(fd, "ERR no_such_group");
-        return;
+        // If group is not known yet, we cannot queue a pending request.
+        // We choose to return an error and NOT create a new group implicitly.
+        // This keeps semantics simple and relies on SYNC ordering (create before join).
+        return "ERR no_such_group";
     }
     Group &g = it->second;
-    if (g.members.count(cur))
+    if (g.members.count(uid))
+        return "ERR already_member";
+    if (find(g.pending.begin(), g.pending.end(), uid) != g.pending.end())
+        return "ERR request_pending";
+
+    g.pending.push_back(uid);
+
+    if (!from_sync)
     {
-        send_line(fd, "ERR already_member");
-        return;
+        string line = "SYNC_JOIN_REQUEST " + gid + " " + uid;
+        append_journal_line_if_new(line);
+        lock_guard<mutex> lg2(peer_fds_mtx);
+        for (int pfd : peer_fds)
+            send_line(pfd, line);
     }
-    for (auto &u : g.pending)
-        if (u == cur)
-        {
-            send_line(fd, "ERR request_pending");
-            return;
-        }
-    g.pending.push_back(cur);
-    send_line(fd, "OK request_sent");
+    return "OK request_sent";
 }
+
 
 // list_groups
 void handle_list_groups(int fd, const vector<string> &args)
@@ -483,7 +500,6 @@ void handle_upload_file(int fd, const vector<string> &args)
     }
     // journal the upload action
     // NOTE: if path contains spaces, tokenization on the receiver may split it.
-    // Consider encoding the path (e.g. base64) for production — keeping simple here.
     string line = "SYNC_UPLOAD_FILE " + gid + " " + cur + " " + fname + " " + path;
     append_journal_line_if_new(line);
     lock_guard<mutex> lg(peer_fds_mtx);
@@ -735,6 +751,15 @@ void handle_sync_line(const string &line)
             }
         }
     }
+    else if (cmd == "SYNC_JOIN_REQUEST")
+    {
+        if (toks.size() >= 3)
+        {
+            // toks[1] = gid, toks[2] = uid
+            apply_join_request(toks[1], toks[2], true);
+        }
+    }
+
     else
     {
         // unknown SYNC command — ignore or log
