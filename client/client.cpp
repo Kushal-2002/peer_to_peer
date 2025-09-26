@@ -1,8 +1,3 @@
-// client.cpp
-// Build: g++ -std=c++17 -pthread client.cpp -o client
-// Usage: ./client tracker_info.txt
-// tracker_info.txt should contain lines like: 127.0.0.1:9000
-
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -19,7 +14,69 @@
 #include <string>
 #include <vector>
 
+#include <openssl/sha.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <iomanip>
+#include <sstream>
+#include <vector>
+#include <string>
+
+
 using namespace std;
+
+// Convert SHA1 digest to hex
+static string sha1_to_hex(const unsigned char *d) {
+    ostringstream oss;
+    oss << hex << setfill('0');
+    for (int i = 0; i < SHA_DIGEST_LENGTH; ++i)
+        oss << setw(2) << (int)d[i];
+    return oss.str();
+}
+
+// Compute piece SHA1s (512 KiB) and full SHA1. Returns true on success.
+bool compute_piece_and_file_sha1(const string &path,
+                                uint64_t &out_filesize,
+                                string &out_fullsha1,
+                                vector<string> &out_piece_sha1s) {
+    const size_t PIECE_SIZE = 512 * 1024;
+    out_piece_sha1s.clear();
+    out_fullsha1.clear();
+    out_filesize = 0;
+
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+
+    SHA_CTX fullctx;
+    SHA1_Init(&fullctx);
+
+    vector<char> buf(PIECE_SIZE);
+    while (true) {
+        ssize_t r = read(fd, buf.data(), (ssize_t)PIECE_SIZE);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return false;
+        }
+        if (r == 0) break;
+
+        SHA1_Update(&fullctx, buf.data(), (size_t)r);
+
+        unsigned char piece_digest[SHA_DIGEST_LENGTH];
+        SHA1(reinterpret_cast<const unsigned char*>(buf.data()), (size_t)r, piece_digest);
+        out_piece_sha1s.push_back(sha1_to_hex(piece_digest));
+
+        out_filesize += (uint64_t)r;
+    }
+    close(fd);
+
+    unsigned char full_digest[SHA_DIGEST_LENGTH];
+    SHA1_Final(full_digest, &fullctx);
+    out_fullsha1 = sha1_to_hex(full_digest);
+    return true;
+}
+
 
 // ---------------- helpers for socket I/O ----------------
 bool send_all(int fd, const string &s) {
@@ -66,20 +123,56 @@ bool recv_line(int fd, string &out) {
 // ---------------- tracker list loader ----------------
 vector<string> load_trackers(const string &path) {
     vector<string> v;
-    ifstream in(path);
-    if (!in.is_open()) {
-        cerr << "Warning: cannot open " << path << "\n";
+
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        cerr << "Warning: cannot open " << path << " (" << strerror(errno) << ")\n";
         return v;
     }
-    string line;
-    while (getline(in, line)) {
+
+    // read file into a string buffer (file is small - tracker_info.txt)
+    const size_t BUF_SZ = 4096;
+    string content;
+    vector<char> buf(BUF_SZ);
+    while (true) {
+        ssize_t r = read(fd, buf.data(), (ssize_t)BUF_SZ);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            cerr << "Warning: read error on " << path << " (" << strerror(errno) << ")\n";
+            close(fd);
+            return v;
+        }
+        if (r == 0) break;
+        content.append(buf.data(), (size_t)r);
+    }
+    close(fd);
+
+    // split into lines and trim whitespace
+    size_t pos = 0;
+    while (pos < content.size()) {
+        // find end of line
+        size_t eol = content.find_first_of("\r\n", pos);
+        string line;
+        if (eol == string::npos) {
+            line = content.substr(pos);
+            pos = content.size();
+        } else {
+            line = content.substr(pos, eol - pos);
+            // skip potential multi-char line endings
+            size_t skip = 1;
+            if (eol + 1 < content.size() && content[eol] == '\r' && content[eol+1] == '\n') skip = 2;
+            pos = eol + skip;
+        }
+        // trim leading/trailing whitespace
         size_t a = line.find_first_not_of(" \t\r\n");
         if (a == string::npos) continue;
         size_t b = line.find_last_not_of(" \t\r\n");
         v.push_back(line.substr(a, b - a + 1));
     }
+
     return v;
 }
+
 
 // ---------------- connect helpers ----------------
 int connect_to_addr(const string &addr) {
@@ -168,7 +261,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    cout << "Type commands (underscore format). Example: create_user alice pass\n";
+    cout << "Type commands : Example: create_user alice pass\n";
     cout << "Type quit or exit to stop.\n";
 
     string raw;
@@ -179,7 +272,47 @@ int main(int argc, char **argv) {
         if (line.empty()) continue;
         if (line == "quit" || line == "exit") break;
 
-        // detect login command to save credentials on success
+        // Quick tokenization (whitespace). NOTE: file paths must NOT contain spaces here.
+        istringstream iss0(line);
+        vector<string> tokens;
+        string tk;
+        while (iss0 >> tk) tokens.push_back(tk);
+
+        // Intercept upload_file to compute piece+file SHA1s and rewrite the line
+        if (!tokens.empty() && tokens[0] == "upload_file") {
+            if (tokens.size() < 3) {
+                cout << "ERR missing_args. Usage: upload_file <group_id> <file_path>\n";
+                continue; // skip sending
+            }
+            string gid = tokens[1];
+            string filepath = tokens[2]; // single-token path (no spaces)
+            cout << "[info] computing SHA1s for '" << filepath << "' ...\n";
+
+            uint64_t filesize = 0;
+            string fullsha1;
+            vector<string> piece_sha1s;
+            if (!compute_piece_and_file_sha1(filepath, filesize, fullsha1, piece_sha1s)) {
+                cout << "ERR cannot_read_file\n";
+                continue;
+            }
+
+            // extract filename from path
+            string fname = filepath;
+            size_t p = fname.find_last_of("/\\");
+            if (p != string::npos) fname = fname.substr(p + 1);
+
+            // construct augmented upload line:
+            // upload_file <group_id> <filename> <filesize> <full_sha1_hex> <num_pieces> <piece1> <piece2> ...
+            ostringstream upl;
+            upl << "upload_file " << gid << " " << fname << " " << filesize << " " << fullsha1 << " " << piece_sha1s.size();
+            for (auto &ph : piece_sha1s) upl << " " << ph;
+            line = upl.str();
+
+            cout << "[info] upload manifest ready (" << piece_sha1s.size() << " pieces)\n";
+            // fall through to normal send/recv logic with modified `line`
+        }
+
+        // detect login command to save credentials on success (unchanged behavior)
         bool is_login = false;
         string login_user, login_pass;
         {
@@ -225,7 +358,7 @@ int main(int argc, char **argv) {
                 }
             }
 
-            // send the user's command
+            // send the user's command (possibly modified)
             if (!send_line(sock, line)) {
                 close(sock); sock = -1;
                 cerr << "Send failed, trying next tracker...\n";
@@ -261,7 +394,7 @@ int main(int argc, char **argv) {
         if (!done) {
             cerr << "Failed to execute command after trying trackers.\n";
         }
-    } // main loop
+    } // end while
 
     if (sock >= 0) close(sock);
     cout << "Client exiting\n";

@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
-#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -21,6 +20,7 @@
 
 using namespace std;
 
+
 // ---------------- basic types ----------------
 struct Group
 {
@@ -29,12 +29,18 @@ struct Group
     vector<string> pending; // pending join requests (user ids)
 };
 
+using namespace std;
+
 struct FileMeta
 {
-    string owner;    // who uploaded
-    string filename; // name only
-    string filepath; // original path provided by uploader (informational)
+    string owner;                  // who uploaded
+    string filename;               // name only
+    string filepath;               // original path provided by uploader (informational)
+    uint64_t filesize = 0;         // file size in bytes
+    string full_sha1;              // full-file SHA1 hex
+    vector<string> piece_sha1s;    // per-piece SHA1 hex (ordered)
 };
+
 
 // ---------------- global state (protected by mutexes) ----------------
 unordered_map<string, string> users; // username -> password
@@ -347,6 +353,108 @@ string apply_join_request(const string &gid, const string &uid, bool from_sync)
     return "OK request_sent";
 }
 
+string apply_leave_group(const string &gid, const string &uid, bool from_sync);
+
+
+// leave_group <group_id>
+void handle_leave_group(int fd, const vector<string> &args)
+{
+    if (args.size() < 2)
+    {
+        send_line(fd, "ERR missing_args");
+        return;
+    }
+    string gid = args[1];
+    string cur = get_user_for_fd(fd);
+    if (cur.empty())
+    {
+        send_line(fd, "ERR login_required");
+        return;
+    }
+    string res = apply_leave_group(gid, cur, /*from_sync=*/false);
+    send_line(fd, res);
+}
+
+string apply_leave_group(const string &gid, const string &uid, bool from_sync)
+{
+    if (gid.empty() || uid.empty())
+        return "ERR missing_args";
+
+    // Lock groups to check membership/pending and mutate
+    {
+        lock_guard<mutex> lg(groups_mtx);
+        auto it = groups.find(gid);
+        if (it == groups.end())
+            return "ERR no_such_group";
+
+        Group &g = it->second;
+
+        // Owner cannot leave in this simple policy
+        if (g.owner == uid)
+            return "ERR owner_cannot_leave";
+
+        // If user is a member -> remove
+        bool removed_member = false;
+        if (g.members.count(uid))
+        {
+            g.members.erase(uid);
+            removed_member = true;
+        }
+
+        // If user had a pending request -> remove it
+        bool removed_pending = false;
+        auto pit = find(g.pending.begin(), g.pending.end(), uid);
+        if (pit != g.pending.end())
+        {
+            g.pending.erase(pit);
+            removed_pending = true;
+        }
+
+        if (!removed_member && !removed_pending)
+            return "ERR not_a_member";
+    }
+
+    // Remove any files shared by uid in this group (and prepare to broadcast SYNC_STOP_SHARE)
+    vector<string> stopped_files;
+    {
+        lock_guard<mutex> lg(group_files_mtx);
+        auto git = group_files.find(gid);
+        if (git != group_files.end())
+        {
+            auto &vec = git->second;
+            // collect filenames owned by uid
+            for (auto &m : vec)
+                if (m.owner == uid)
+                    stopped_files.push_back(m.filename);
+            // erase them
+            vec.erase(remove_if(vec.begin(), vec.end(),
+                                [&](const FileMeta &m) { return m.owner == uid; }),
+                      vec.end());
+        }
+    }
+
+    if (!from_sync)
+    {
+        // journal & broadcast the leave line
+        string line = "SYNC_LEAVE_GROUP " + gid + " " + uid;
+        append_journal_line_if_new(line);
+        lock_guard<mutex> lg(peer_fds_mtx);
+        for (int pfd : peer_fds)
+            send_line(pfd, line);
+
+        // For each file we removed, journal & broadcast a STOP_SHARE so peers also remove it
+        for (const string &fname : stopped_files)
+        {
+            string s = "SYNC_STOP_SHARE " + gid + " " + uid + " " + fname;
+            append_journal_line_if_new(s);
+            for (int pfd : peer_fds)
+                send_line(pfd, s);
+        }
+    }
+
+    return "OK left_group";
+}
+
 
 // list_groups
 void handle_list_groups(int fd, const vector<string> &args)
@@ -461,14 +569,15 @@ void handle_logout(int fd, const vector<string> &args)
 
 void handle_upload_file(int fd, const vector<string> &args)
 {
-    // upload_file <group_id> <file_path> <listen_ip> <listen_port>
-    // note: listen_ip and listen_port are optional; we store owner identity for now
+    // Expected client command (augmented):
+    // upload_file <group_id> <filename> <filesize> <fullsha1> <num_pieces> <piece1> <piece2> ...
     if (args.size() < 3)
     {
         send_line(fd, "ERR missing_args");
         return;
     }
-    string gid = args[1], path = args[2];
+    string gid = args[1];
+    string fname = args[2];
     string cur = get_user_for_fd(fd);
     if (cur.empty())
     {
@@ -489,18 +598,43 @@ void handle_upload_file(int fd, const vector<string> &args)
             return;
         }
     }
-    string fname = path;
-    size_t p = fname.find_last_of("/\\");
-    if (p != string::npos)
-        fname = fname.substr(p + 1);
-    FileMeta m{cur, fname, path};
+
+    // parse optional metadata
+    uint64_t filesize = 0;
+    string fullsha1;
+    vector<string> piece_sha1s;
+    if (args.size() >= 6) {
+        // args layout: [0]=upload_file [1]=gid [2]=fname [3]=filesize [4]=fullsha1 [5]=num_pieces [6..] piece hashes
+        try {
+            filesize = stoull(args[3]);
+        } catch (...) { filesize = 0; }
+        fullsha1 = args[4];
+        int nump = 0;
+        try { nump = stoi(args[5]); } catch(...) { nump = 0; }
+        for (int i = 0; i < nump && (6 + i) < (int)args.size(); ++i) {
+            piece_sha1s.push_back(args[6 + i]);
+        }
+    }
+
+    FileMeta m;
+    m.owner = cur;
+    m.filename = fname;
+    m.filepath = fname;
+    m.filesize = filesize;
+    m.full_sha1 = fullsha1;
+    m.piece_sha1s = piece_sha1s;
+
     {
         lock_guard<mutex> lg(group_files_mtx);
         group_files[gid].push_back(m);
     }
-    // journal the upload action
-    // NOTE: if path contains spaces, tokenization on the receiver may split it.
-    string line = "SYNC_UPLOAD_FILE " + gid + " " + cur + " " + fname + " " + path;
+
+    // journal the upload action with the richer sync line
+    // SYNC_UPLOAD_FILE <gid> <owner> <fname> <filesize> <fullsha1> <num_pieces> <piece1> ...
+    ostringstream oss;
+    oss << "SYNC_UPLOAD_FILE " << gid << " " << cur << " " << fname << " " << filesize << " " << fullsha1 << " " << piece_sha1s.size();
+    for (auto &h : piece_sha1s) oss << " " << h;
+    string line = oss.str();
     append_journal_line_if_new(line);
     lock_guard<mutex> lg(peer_fds_mtx);
     for (int pfd : peer_fds)
@@ -508,6 +642,7 @@ void handle_upload_file(int fd, const vector<string> &args)
 
     send_line(fd, "OK upload_registered");
 }
+
 
 void handle_list_files(int fd, const vector<string> &args)
 {
@@ -658,9 +793,7 @@ void dispatch_command(int fd, const vector<string> &tokens)
     else if (cmd == "join_group")
         handle_join_group(fd, tokens);
     else if (cmd == "leave_group")
-    { /* not implemented in this simple sync example */
-        send_line(fd, "ERR not_implemented");
-    }
+        handle_leave_group(fd, tokens);
     else if (cmd == "list_groups")
         handle_list_groups(fd, tokens);
     else if (cmd == "list_requests")
@@ -680,7 +813,7 @@ void dispatch_command(int fd, const vector<string> &tokens)
         handle_show_downloads(fd, tokens);
     else if (cmd == "stop_share")
         handle_stop_share(fd, tokens);
-
+    
     else
         send_line(fd, "ERR unknown_cmd");
 }
@@ -717,24 +850,6 @@ void handle_sync_line(const string &line)
         if (toks.size() >= 4)
             apply_accept_request(toks[1], toks[2], toks[3], true);
     }
-    else if (cmd == "SYNC_UPLOAD_FILE")
-    {
-        if (toks.size() >= 5)
-        {
-            string gid = toks[1], owner = toks[2], fname = toks[3], path = toks[4];
-            lock_guard<mutex> lg(group_files_mtx);
-            auto &vec = group_files[gid];
-            bool found = false;
-            for (auto &m : vec)
-                if (m.filename == fname && m.owner == owner)
-                {
-                    found = true;
-                    break;
-                }
-            if (!found)
-                vec.push_back(FileMeta{owner, fname, path});
-        }
-    }
     else if (cmd == "SYNC_STOP_SHARE")
     {
         if (toks.size() >= 4)
@@ -759,6 +874,54 @@ void handle_sync_line(const string &line)
             apply_join_request(toks[1], toks[2], true);
         }
     }
+    else if (cmd == "SYNC_LEAVE_GROUP")
+    {
+        if (toks.size() >= 3)
+            apply_leave_group(toks[1], toks[2], true);
+    }
+    else if (cmd == "SYNC_UPLOAD_FILE")
+    {
+        // SYNC_UPLOAD_FILE <gid> <owner> <fname> <filesize> <fullsha1> <num_pieces> <piece1> ...
+        if (toks.size() >= 6)
+        {
+            string gid = toks[1];
+            string owner = toks[2];
+            string fname = toks[3];
+            uint64_t filesize = 0;
+            try { filesize = stoull(toks[4]); } catch(...) { filesize = 0; }
+            string fullsha1 = toks[5];
+            int nump = 0;
+            if (toks.size() >= 7) {
+                try { nump = stoi(toks[6]); } catch(...) { nump = 0; }
+            }
+            vector<string> piece_sha1s;
+            for (int i = 0; i < nump; ++i) {
+                size_t idx = 7 + i;
+                if (idx < toks.size())
+                    piece_sha1s.push_back(toks[idx]);
+                else break;
+            }
+
+            lock_guard<mutex> lg(group_files_mtx);
+            auto &vec = group_files[gid];
+            // Avoid duplicating same owner+filename
+            bool found = false;
+            for (auto &fm : vec) {
+                if (fm.filename == fname && fm.owner == owner) { found = true; break; }
+            }
+            if (!found) {
+                FileMeta fm;
+                fm.owner = owner;
+                fm.filename = fname;
+                fm.filepath = fname;
+                fm.filesize = filesize;
+                fm.full_sha1 = fullsha1;
+                fm.piece_sha1s = piece_sha1s;
+                vec.push_back(std::move(fm));
+            }
+        }
+    }
+
 
     else
     {
