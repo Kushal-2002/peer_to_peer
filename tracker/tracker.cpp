@@ -39,6 +39,7 @@ struct FileMeta
     uint64_t filesize = 0;         // file size in bytes
     string full_sha1;              // full-file SHA1 hex
     vector<string> piece_sha1s;    // per-piece SHA1 hex (ordered)
+    string peer_addr;
 };
 
 
@@ -147,6 +148,44 @@ void cleanup_fd(int fd)
 {
     lock_guard<mutex> lg(sessions_mtx);
     sessions.erase(fd);
+}
+
+// get_manifest <group_id> <filename>
+// reply:
+// OK manifest <filesize> <fullsha1> <num_pieces> <peer1,peer2,...> <piece1> <piece2> ...
+// or ERR no_such_file
+void handle_get_manifest(int fd, const vector<string> &args) {
+    if (args.size() < 3) { send_line(fd, "ERR missing_args"); return; }
+    string gid = args[1], fname = args[2];
+
+    lock_guard<mutex> lg(group_files_mtx);
+    auto it = group_files.find(gid);
+    if (it == group_files.end()) { send_line(fd, "ERR no_such_group"); return; }
+
+    // pick the first matching file meta (could be multiple owners; you can extend later)
+    FileMeta *fm = nullptr;
+    vector<string> peer_entries;
+    for (auto &m : it->second) {
+        if (m.filename == fname) {
+            if (!fm) fm = &const_cast<FileMeta&>(m); // take first as manifest source
+            // add owner@peer_addr if available
+            string entry = m.owner + "@" + (m.peer_addr.empty() ? "-" : m.peer_addr);
+            peer_entries.push_back(entry);
+        }
+    }
+    if (!fm) { send_line(fd, "ERR no_such_file"); return; }
+
+    ostringstream oss;
+    oss << "OK manifest " << fm->filesize << " " << fm->full_sha1 << " " << fm->piece_sha1s.size();
+    // peers as comma-separated token (no spaces)
+    oss << " ";
+    for (size_t i = 0; i < peer_entries.size(); ++i) {
+        if (i) oss << ",";
+        oss << peer_entries[i];
+    }
+    // then piece hashes as separate tokens
+    for (auto &ph: fm->piece_sha1s) oss << " " << ph;
+    send_line(fd, oss.str());
 }
 
 // ---------------- journal helpers (in-memory) ----------------
@@ -603,16 +642,18 @@ void handle_upload_file(int fd, const vector<string> &args)
     uint64_t filesize = 0;
     string fullsha1;
     vector<string> piece_sha1s;
-    if (args.size() >= 6) {
-        // args layout: [0]=upload_file [1]=gid [2]=fname [3]=filesize [4]=fullsha1 [5]=num_pieces [6..] piece hashes
-        try {
-            filesize = stoull(args[3]);
-        } catch (...) { filesize = 0; }
+    string peer_token = "-";
+    if (args.size() >= 7) { 
+        // args layout: [0]=upload_file [1]=gid [2]=fname [3]=filesize [4]=fullsha1 [5]=num_pieces [6]=peer_token [7..] piece hashes
+        try { filesize = stoull(args[3]); } catch(...) { filesize = 0; }
         fullsha1 = args[4];
         int nump = 0;
         try { nump = stoi(args[5]); } catch(...) { nump = 0; }
-        for (int i = 0; i < nump && (6 + i) < (int)args.size(); ++i) {
-            piece_sha1s.push_back(args[6 + i]);
+        // peer token is next
+        if ((size_t)6 < args.size()) peer_token = args[6];
+        // piece hashes follow starting at index 7
+        for (int i = 0; i < nump && (7 + i) < (int)args.size(); ++i) {
+            piece_sha1s.push_back(args[7 + i]);
         }
     }
 
@@ -623,7 +664,7 @@ void handle_upload_file(int fd, const vector<string> &args)
     m.filesize = filesize;
     m.full_sha1 = fullsha1;
     m.piece_sha1s = piece_sha1s;
-
+    m.peer_addr = peer_token;
     {
         lock_guard<mutex> lg(group_files_mtx);
         group_files[gid].push_back(m);
@@ -632,10 +673,14 @@ void handle_upload_file(int fd, const vector<string> &args)
     // journal the upload action with the richer sync line
     // SYNC_UPLOAD_FILE <gid> <owner> <fname> <filesize> <fullsha1> <num_pieces> <piece1> ...
     ostringstream oss;
-    oss << "SYNC_UPLOAD_FILE " << gid << " " << cur << " " << fname << " " << filesize << " " << fullsha1 << " " << piece_sha1s.size();
+    oss << "SYNC_UPLOAD_FILE " << gid << " " << cur << " " << fname << " "
+        << filesize << " " << fullsha1 << " " << piece_sha1s.size()
+        << " " << peer_token;
     for (auto &h : piece_sha1s) oss << " " << h;
     string line = oss.str();
     append_journal_line_if_new(line);
+
+
     lock_guard<mutex> lg(peer_fds_mtx);
     for (int pfd : peer_fds)
         send_line(pfd, line);
@@ -686,49 +731,31 @@ void handle_download_file(int fd, const vector<string> &args)
         send_line(fd, "ERR login_required");
         return;
     }
-    {
-        lock_guard<mutex> lg(groups_mtx);
-        auto it = groups.find(gid);
-        if (it == groups.end())
-        {
-            send_line(fd, "ERR no_such_group");
-            return;
-        }
-        if (!it->second.members.count(cur))
-        {
-            send_line(fd, "ERR not_a_member");
-            return;
-        }
-    }
-    // return peers (owner usernames) that have the file (tracker doesn't know IP:port by default)
-    vector<string> peers;
+    vector<string> peer_entries;
     {
         lock_guard<mutex> lg(group_files_mtx);
         auto it = group_files.find(gid);
-        if (it != group_files.end())
-        {
-            for (auto &m : it->second)
-            {
-                if (m.filename == fname)
-                    peers.push_back(m.owner);
+        if (it != group_files.end()) {
+            for (auto &m : it->second) {
+                if (m.filename == fname) {
+                    // format "owner@ip:port" or just peer_addr if you prefer
+                    string entry = m.owner + "@" + (m.peer_addr.empty() ? "-" : m.peer_addr);
+                    peer_entries.push_back(entry);
+                }
             }
         }
     }
-    if (peers.empty())
-    {
+    if (peer_entries.empty()) {
         send_line(fd, "ERR no_such_file");
         return;
     }
     string out = "OK peers:";
-    bool first = true;
-    for (auto &p : peers)
-    {
-        if (!first)
-            out += ",";
-        first = false;
-        out += p;
+    for (size_t i = 0; i < peer_entries.size(); ++i) {
+        if (i) out += ",";
+        out += peer_entries[i];
     }
     send_line(fd, out);
+
 }
 // Here we are just using a stub
 void handle_show_downloads(int fd, const vector<string> &args)
@@ -813,7 +840,9 @@ void dispatch_command(int fd, const vector<string> &tokens)
         handle_show_downloads(fd, tokens);
     else if (cmd == "stop_share")
         handle_stop_share(fd, tokens);
-    
+    else if (cmd == "get_manifest")
+    handle_get_manifest(fd, tokens);
+
     else
         send_line(fd, "ERR unknown_cmd");
 }
@@ -881,9 +910,8 @@ void handle_sync_line(const string &line)
     }
     else if (cmd == "SYNC_UPLOAD_FILE")
     {
-        // SYNC_UPLOAD_FILE <gid> <owner> <fname> <filesize> <fullsha1> <num_pieces> <piece1> ...
-        if (toks.size() >= 6)
-        {
+        // SYNC_UPLOAD_FILE <gid> <owner> <fname> <filesize> <fullsha1> <num_pieces> <peer_token> <piece1> ...
+        if (toks.size() >= 7) {
             string gid = toks[1];
             string owner = toks[2];
             string fname = toks[3];
@@ -891,20 +919,25 @@ void handle_sync_line(const string &line)
             try { filesize = stoull(toks[4]); } catch(...) { filesize = 0; }
             string fullsha1 = toks[5];
             int nump = 0;
-            if (toks.size() >= 7) {
-                try { nump = stoi(toks[6]); } catch(...) { nump = 0; }
+            try { nump = stoi(toks[6]); } catch(...) { nump = 0; }
+
+            // peer token is at index 7
+            string peer_token = "-";
+            size_t piece_start_idx = 7;
+            if (7 < toks.size()) {
+                peer_token = toks[7];
+                piece_start_idx = 8; // piece hashes start after peer_token
             }
+
             vector<string> piece_sha1s;
             for (int i = 0; i < nump; ++i) {
-                size_t idx = 7 + i;
-                if (idx < toks.size())
-                    piece_sha1s.push_back(toks[idx]);
+                size_t idx = piece_start_idx + i;
+                if (idx < toks.size()) piece_sha1s.push_back(toks[idx]);
                 else break;
             }
 
             lock_guard<mutex> lg(group_files_mtx);
             auto &vec = group_files[gid];
-            // Avoid duplicating same owner+filename
             bool found = false;
             for (auto &fm : vec) {
                 if (fm.filename == fname && fm.owner == owner) { found = true; break; }
@@ -917,9 +950,11 @@ void handle_sync_line(const string &line)
                 fm.filesize = filesize;
                 fm.full_sha1 = fullsha1;
                 fm.piece_sha1s = piece_sha1s;
+                fm.peer_addr = peer_token;
                 vec.push_back(std::move(fm));
             }
         }
+
     }
 
 
