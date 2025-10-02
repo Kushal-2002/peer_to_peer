@@ -909,7 +909,7 @@ void handle_download_file(int fd, const vector<string> &args)
 void handle_show_downloads(int fd, const vector<string> &args)
 {
     (void)args;
-    send_line(fd, "OK (no_downloads)");
+    send_line(fd, "OK ");
 }
 
 void handle_stop_share(int fd, const vector<string> &args)

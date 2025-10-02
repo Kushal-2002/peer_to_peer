@@ -84,6 +84,29 @@ struct DownloadJob
 mutex downloads_mtx;
 unordered_map<string, shared_ptr<DownloadJob>> downloads; // id -> job
 
+// remember files we announced to tracker: filename -> group id
+// this lets us call stop_share on exit or later.
+unordered_map<string,string> local_uploaded_gid; // basename -> gid
+mutex local_uploaded_mtx;
+
+// Remove basename and owner:basename mapping (if present)
+void unregister_shared_file(const string &basename, const string &owner = "") {
+    lock_guard<mutex> lg(shared_files_mtx);
+    auto it = shared_files.find(basename);
+    if (it != shared_files.end()) {
+        shared_files.erase(it);
+        log_to_file_sync("[shared_files] unregistered: '" + basename + "'");
+    }
+    if (!owner.empty()) {
+        string owner_key = owner + ":" + basename;
+        auto it2 = shared_files.find(owner_key);
+        if (it2 != shared_files.end()) {
+            shared_files.erase(it2);
+            log_to_file_sync("[shared_files] unregistered: '" + owner_key + "'");
+        }
+    }
+}
+
 static string make_download_id(const string &gid, const string &fname)
 {
     auto now = chrono::system_clock::now();
@@ -1440,7 +1463,6 @@ void background_download_worker(shared_ptr<DownloadJob> job,
     // to job->destpath by the manager, so it is available locally on disk.
 
     // Provide a helpful message so the caller/UI can see what to do next:
-    job->last_tracker_reply = "download_complete_manual_upload_required";
     job->status.store(DLStatus::SUCCESS);
 
     // If you want, you can set a user-visible hint with the full sha and piece list:
@@ -1725,6 +1747,74 @@ int main(int argc, char **argv)
             cout << "[info] upload manifest ready (" << piece_sha1s.size() << " pieces)\n";
             // fall through to normal send/recv logic with modified `line`
         }
+        // intercept stop_share <group_id> <filename>
+        if (!tokens.empty() && tokens[0] == "stop_share") {
+            if (!logged_in) {
+                cout << "ERR not_logged_in\n";
+                continue;
+            }
+            if (tokens.size() < 3) {
+                cout << "ERR missing_args. Usage: stop_share <group_id> <filename>\n";
+                continue;
+            }
+            string gid = tokens[1];
+            string fname = tokens[2];
+
+            // send stop_share to tracker (ensure sock connected)
+            if (sock < 0) {
+                int idx;
+                sock = connect_any_tracker(trackers, last_try, idx);
+                if (sock < 0) {
+                    cout << "ERR tracker_unreachable\n";
+                    continue;
+                }
+                connected_idx = idx;
+                last_try = (connected_idx + 1) % (int)trackers.size();
+                cout << "Connected to tracker: " << trackers[connected_idx] << "\n";
+            }
+
+            string cmd = "stop_share " + gid + " " + fname;
+            if (!send_line(sock, cmd)) {
+                close(sock); sock = -1;
+                cout << "ERR tracker_send_failed\n";
+                continue;
+            }
+            string trep;
+            if (!recv_line(sock, trep)) {
+                close(sock); sock = -1;
+                cout << "ERR tracker_no_reply\n";
+                continue;
+            }
+            cout << trep << "\n";
+
+            // if tracker accepted, remove local mappings so peer server stops serving
+            if (trep.rfind("OK", 0) == 0) {
+                {
+                    // remove from shared_files
+                    lock_guard<mutex> lg(current_user_mtx);
+                    string owner;
+                    owner = current_user; // may be empty, but unregister handles empty fine
+                    unregister_shared_file(fname, owner);
+                }
+                // remove from local_uploaded_gid map
+                {
+                    lock_guard<mutex> lg(local_uploaded_mtx);
+                    // local_uploaded_gid uses basename -> gid
+                    auto it = local_uploaded_gid.find(fname);
+                    if (it != local_uploaded_gid.end()) local_uploaded_gid.erase(it);
+                    // also remove any gid:filename composite variants if you used that scheme:
+                    string key = gid + ":" + fname;
+                    // if you used gid:filename->... mapping, attempt to erase
+                    if (local_uploaded_gid.count(key)) local_uploaded_gid.erase(key);
+                }
+            } else {
+                // not OK — tracker refused; do not remove local sharing
+                cout << "[stop_share] tracker refused or error\n";
+            }
+
+            continue; // skip sending stop_share as a normal command because we've already handled it
+        }
+
         // replace existing show_downloads block with this
         if (!tokens.empty() && tokens[0] == "show_downloads")
         {
@@ -1741,31 +1831,22 @@ int main(int argc, char **argv)
                     char tag = '?';
                     switch (j->status.load())
                     {
-                    case DLStatus::QUEUED:
-                        tag = 'Q';
-                        break; // queued
-                    case DLStatus::RUNNING:
-                        tag = 'R';
-                        break; // running
-                    case DLStatus::SUCCESS:
-                        tag = 'C';
-                        break; // completed -> 'C' as requested
-                    case DLStatus::FAILED:
-                        tag = 'F';
-                        break; // failed
-                    case DLStatus::CANCELLED:
-                        tag = 'X';
-                        break; // cancelled
-                    default:
-                        tag = '?';
-                        break;
+                        case DLStatus::QUEUED:   tag = 'Q'; break;
+                        case DLStatus::RUNNING:  tag = 'R'; break;
+                        case DLStatus::SUCCESS:  tag = 'C'; break; // Completed
+                        case DLStatus::FAILED:   tag = 'F'; break;
+                        case DLStatus::CANCELLED:tag = 'X'; break;
+                        default:                 tag = '?'; break;
                     }
-                    cout << "[" << tag << "] [" << j->gid << "] " << j->filename;
-
-                    cout << "\n";
+                    // print only the concise status line (no tracker reply)
+                    cout << "[" << tag << "] [" << j->gid << "] " << j->filename << "\n";
                 }
             }
+
+            // IMPORTANT: don't forward this command to the tracker; we've handled it locally.
+            continue;
         }
+
 
         // intercept download_file <group_id> <filename> <destpath>
         if (!tokens.empty() && tokens[0] == "download_file")
@@ -1983,8 +2064,7 @@ int main(int argc, char **argv)
                     job->total_bytes = new_filesize;
                     job->total_pieces = new_piece_sha1s.size();
 
-                    // optional: set hint so user knows to perform manual upload
-                    job->last_tracker_reply = "download_complete_manual_upload_required: run `upload_file " + job->gid + " " + destpath_copy + "`";
+
 
                     job->status.store(DLStatus::SUCCESS);
                 } catch (const std::exception &e) {
@@ -2059,6 +2139,29 @@ int main(int argc, char **argv)
 
             // print the response
             cout << resp << "\n";
+
+            // after: cout << resp << "\n";
+            if (line.rfind("upload_file ", 0) == 0 && resp.rfind("OK", 0) == 0) {
+                // parse gid and filename from the augmented upload line
+                istringstream is(line);
+                string cmd, gid, fname;
+                is >> cmd >> gid >> fname;
+                if (!gid.empty() && !fname.empty()) {
+                    {
+                        lock_guard<mutex> lg(local_uploaded_mtx);
+                        local_uploaded_gid[fname] = gid;            // basename -> gid
+                        local_uploaded_gid[gid + ":" + fname] = gid; // optional canonical key
+                    }
+                    // ensure peer server will resolve owner:filename
+                    {
+                        lock_guard<mutex> lg(current_user_mtx);
+                        if (!current_user.empty()) register_shared_file_both(fname, shared_files[fname], current_user);
+                        else register_shared_file(fname, shared_files[fname]);
+                    }
+                    log_to_file_sync("[upload] registered local_uploaded_gid for " + gid + ":" + fname);
+                }
+            }
+
 
             // if login succeeded, mark session as logged-in for this run (do NOT save credentials)
             if (is_login)
