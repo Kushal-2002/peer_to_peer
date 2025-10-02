@@ -43,16 +43,7 @@ ssize_t read_file_piece(const string &filepath, off_t offset, void *buf, size_t 
 string current_user;
 mutex current_user_mtx;
 
-<<<<<<< HEAD
-// current logged-in user for this client process (set on login)
-string current_user;
-mutex current_user_mtx;
-
-
-unordered_map<string,string> shared_files; // filename -> full path
-=======
 unordered_map<string,string> shared_files; // basename -> fullpath
->>>>>>> 053444a (download_background)
 mutex shared_files_mtx;
 
 // ---------------- download job definitions ----------------
@@ -103,29 +94,7 @@ void register_shared_file_both(const std::string &basename,
     cerr << "\n";
 }
 
-<<<<<<< HEAD
-// Atomically register basename -> fullpath and owner:basename -> fullpath (if owner non-empty)
-void register_shared_file_both(const std::string &basename,
-                               const std::string &fullpath,
-                               const std::string &owner = "") {
-    lock_guard<mutex> lg(shared_files_mtx);
-    // register basename mapping (legacy)
-    shared_files[basename] = fullpath;
-    // register owner-scoped mapping if owner provided
-    if (!owner.empty()) {
-        string owner_key = owner + ":" + basename;
-        shared_files[owner_key] = fullpath;
-    }
-    cerr << "[shared_files] registered: '" << basename << "' -> '" << fullpath << "'";
-    if (!owner.empty()) cerr << " and '" << owner << ":" << basename << "'";
-    cerr << "\n";
-}
-
-
-// Convert SHA1 digest to hex
-=======
 // ---------------- SHA helpers ----------------
->>>>>>> 053444a (download_background)
 static string sha1_to_hex(const unsigned char *d) {
     ostringstream oss;
     oss << hex << setfill('0');
@@ -514,7 +483,6 @@ bool download_manager_multipeer(const vector<string> &peer_entries,
         size_t at = pe.find('@');
         string owner = (at == string::npos) ? string() : pe.substr(0, at);
         string addr = (at == string::npos) ? pe : pe.substr(at + 1);
-        cerr << "[debug] peer entry: owner='" << owner << "' addr='" << addr << "'\n";
         if (addr == "-" || addr.empty()) continue;
         auto p = make_shared<PeerInfo>();
         p->owner = owner;
@@ -947,33 +915,11 @@ int main(int argc, char **argv) {
             string fname = filepath;
             size_t p = fname.find_last_of("/\\");
             if (p != string::npos) fname = fname.substr(p + 1);
-<<<<<<< HEAD
-
-            // register basename -> fullpath
-            register_shared_file(fname, filepath);
-
-            // register owner:basename -> fullpath so peer handler can resolve owner-specific requests
-            {
-                lock_guard<mutex> lg(current_user_mtx);
-                if (!current_user.empty()) {
-                    string owner_key = current_user + ":" + fname;
-                    register_shared_file(owner_key, filepath);
-                } else {
-                    // Not logged in: still register basename only (legacy)
-                }
-            }
-
-
-
-            // construct augmented upload line:
-            // upload_file <group_id> <filename> <filesize> <full_sha1_hex> <num_pieces> <piece1> <piece2> ...
-=======
             register_shared_file(fname, filepath);
             {
                 lock_guard<mutex> lg(current_user_mtx);
                 if (!current_user.empty()) register_shared_file(current_user + ":" + fname, filepath);
             }
->>>>>>> 053444a (download_background)
             string peer_token = (my_peer_port > 0) ? my_peer_addr : "-";
             ostringstream upl;
             upl << "upload_file " << gid << " " << fname << " " << filesize << " " << fullsha1 << " " << piece_sha1s.size()
@@ -985,131 +931,19 @@ int main(int argc, char **argv) {
 
         // download_file -> start background job
         if (!tokens.empty() && tokens[0] == "download_file") {
-<<<<<<< HEAD
-            if (!logged_in) {
-                cout << "ERR not_logged_in\n";
-                continue;
-            }
-            if (tokens.size() < 4) {
-                cout << "ERR missing_args. Usage: download_file <group_id> <filename> <destpath>\n";
-                continue;
-            }
-            string gid = tokens[1], fname = tokens[2], destpath = tokens[3];
-            // ...existing code...
-            // ask tracker for manifest
-=======
             if (!logged_in) { cout << "ERR not_logged_in\n"; continue; }
             if (tokens.size() < 4) { cout << "ERR missing_args. Usage: download_file <group_id> <filename> <destpath>\n"; continue; }
             string gid = tokens[1], fname = tokens[2], destpath = tokens[3];
 
             // ask tracker for manifest synchronously (just to show peers quickly)
->>>>>>> 053444a (download_background)
             string getm = "get_manifest " + gid + " " + fname;
             if (!send_line(sock, getm)) { cerr << "tracker send failed\n"; close(sock); sock = -1; break; }
             string trep;
             if (!recv_line(sock, trep)) { cerr << "tracker closed\n"; close(sock); sock = -1; break; }
-<<<<<<< HEAD
-            // cout << trep << "\n"; // show tracker reply
-            uint64_t filesize = 0;
-            string fullsha1;
-            vector<string> piece_hashes;
-            vector<string> peer_entries;
-=======
             uint64_t filesize = 0; string fullsha1; vector<string> piece_hashes; vector<string> peer_entries;
->>>>>>> 053444a (download_background)
             if (!parse_manifest_line(trep, filesize, fullsha1, piece_hashes, peer_entries)) {
                 cout << "ERR manifest_parse_failed\n"; continue;
             }
-<<<<<<< HEAD
-            // DEBUG: Print all peer entries
-            cerr << "[debug] peer_entries from manifest:";
-            for (const auto& pe : peer_entries) cerr << " [" << pe << "]";
-            cerr << endl;
-            // pick first peer that has an ip:port (peer entry format is owner@ip:port)
-            string chosen_peer_addr;
-            for (auto &pe : peer_entries) {
-                size_t at = pe.find('@');
-                string addr = (at == string::npos) ? pe : pe.substr(at + 1);
-                if (addr != "-" && !addr.empty()) { chosen_peer_addr = addr; break; }
-            }
-            if (chosen_peer_addr.empty()) {
-                cout << "ERR no_peer_address_available\n";
-                continue;
-            }
-            cout << "[dl] downloading from " << chosen_peer_addr << " ...\n";
-            // call multi-peer manager
-            bool ok = download_manager_multipeer(peer_entries, fname, destpath, filesize, piece_hashes, fullsha1);
-            if (ok) {
-                cout << "OK download_complete\n";
-
-                // 1) Register locally so peer server can serve this file.
-                string owner;
-                {
-                    lock_guard<mutex> lg(current_user_mtx);
-                    owner = current_user; // may be empty if not logged in
-                }
-
-                // If you want privacy/avoid collisions, you may prefer to register only owner:basename.
-                // The code below registers both (legacy + owner-scoped) like before.
-                if (!owner.empty()) register_shared_file_both(fname, destpath, owner);
-                else register_shared_file(fname, destpath);
-
-                // 2) Compute piece+file SHA1s for the downloaded file.
-                uint64_t new_filesize = 0;
-                string new_fullsha1;
-                vector<string> new_piece_sha1s;
-                if (!compute_piece_and_file_sha1(destpath, new_filesize, new_fullsha1, new_piece_sha1s)) {
-                    cerr << "[dl] warning: cannot compute sha1s of downloaded file; will not announce to tracker\n";
-                    continue; // skip announce but file is registered locally
-                }
-
-                // 3) Build the upload manifest string exactly like upload_file interception does.
-                // Make sure `gid` (group id used for download) is in scope here (it is in your download handler).
-                string peer_token = (my_peer_port > 0) ? my_peer_addr : "-";
-                ostringstream upl;
-                // Format used by upload interception:
-                // upload_file <group_id> <filename> <filesize> <full_sha1_hex> <num_pieces> <peer_token> <piece1> <piece2> ...
-                upl << "upload_file " << gid << " " << fname << " " << new_filesize << " " << new_fullsha1
-                    << " " << new_piece_sha1s.size() << " " << peer_token;
-                for (auto &ph : new_piece_sha1s) upl << " " << ph;
-                string upl_line = upl.str();
-
-                // 4) Ensure we have a tracker connection and send the manifest.
-                // Reuse current sock if available; otherwise reconnect to any tracker.
-                if (sock < 0) {
-                    int idx;
-                    sock = connect_any_tracker(trackers, last_try, idx);
-                    if (sock >= 0) {
-                        connected_idx = idx;
-                        last_try = (connected_idx + 1) % (int)trackers.size();
-                        cout << "Connected to tracker: " << trackers[connected_idx] << "\n";
-                    } else {
-                        cerr << "[dl] warning: cannot connect to tracker to announce seed status\n";
-                    }
-                }
-
-                if (sock >= 0) {
-                    // Send manifest and wait for single-line reply
-                    if (!send_line(sock, upl_line)) {
-                        cerr << "[dl] warning: failed to send upload manifest to tracker\n";
-                        close(sock); sock = -1;
-                    } else {
-                        string trep;
-                        if (!recv_line(sock, trep)) {
-                            cerr << "[dl] warning: tracker closed while announcing upload\n";
-                            close(sock); sock = -1;
-                        } else {
-                            cout << "[tracker reply] " << trep << "\n";
-                            // If OK, the tracker will now include this client as a peer in future manifests.
-                        }
-                    }
-                }
-
-            } else {
-                cout << "ERR download_failed\n";
-            }
-            continue; // skip sending this original command to tracker (we already handled it)
-=======
             // create job and launch worker thread
             auto job = make_shared<DownloadJob>();
             job->gid = gid; job->filename = fname; job->destpath = destpath;
@@ -1127,14 +961,6 @@ int main(int argc, char **argv) {
             });
             cout << "OK download_started id=" << job->id << "\n";
             continue;
->>>>>>> 053444a (download_background)
-        }
-        // intercept list_files <group_id>
-        if (!tokens.empty() && tokens[0] == "list_files") {
-            if (!logged_in) {
-                cout << "ERR not_logged_in\n";
-                continue;
-            }
         }
 
         // show_downloads
@@ -1199,20 +1025,6 @@ int main(int argc, char **argv) {
 
             if (is_login) {
                 if (resp.rfind("OK", 0) == 0) {
-<<<<<<< HEAD
-                    {
-                        lock_guard<mutex> lg(current_user_mtx);
-                        current_user = login_user;
-                    }
-                    logged_in = true;
-                    cout << "[info] login successful for user '" << login_user << "'.\n";
-                } else {
-                    // clear on failure
-                    {
-                        lock_guard<mutex> lg(current_user_mtx);
-                        current_user.clear();
-                    }
-=======
                     lock_guard<mutex> lg(current_user_mtx);
                     current_user = login_user;
                     logged_in = true;
@@ -1220,11 +1032,9 @@ int main(int argc, char **argv) {
                 } else {
                     lock_guard<mutex> lg(current_user_mtx);
                     current_user.clear();
->>>>>>> 053444a (download_background)
                     logged_in = false;
                 }
             }
-
 
             done = true;
             break;
