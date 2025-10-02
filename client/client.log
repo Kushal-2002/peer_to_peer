@@ -1,0 +1,43 @@
+2025-10-02 16:44:54 [shared_files] registered: 'random_1GB.txt' -> '/home/kushal-mukherjee/Desktop/random_1GB.txt'
+2025-10-02 16:44:54 [shared_files] registered: 'alice:random_1GB.txt' -> '/home/kushal-mukherjee/Desktop/random_1GB.txt'
+2025-10-02 16:45:50 [shared_files] registered: 'random_1GB.txt' -> '/home/kushal-mukherjee/Desktop/r1.txt'
+2025-10-02 16:45:50 [shared_files] registered: 'random_1GB.txt' -> '/home/kushal-mukherjee/Desktop/r1.txt'
+2025-10-02 16:48:37 [shared_files] registered: 'random_1GB.txt' -> '/home/kushal-mukherjee/Desktop/r2.txt'
+2025-10-02 16:48:37 [shared_files] registered: 'random_1GB.txt' -> '/home/kushal-mukherjee/Desktop/r2.txt'
+2025-10-02 16:59:38 [shared_files] registered: '2025201072_todoapp.zip' -> '/home/kushal-mukherjee/Desktop/2025201072_todoapp.zip'
+2025-10-02 16:59:38 [shared_files] registered: 'alice:2025201072_todoapp.zip' -> '/home/kushal-mukherjee/Desktop/2025201072_todoapp.zip'
+2025-10-02 17:01:23 [debug] peer entry: owner='alice' addr='127.0.0.1:5002'
+2025-10-02 17:01:23 [shared_files] registered: '2025201072_todoapp.zip' -> '/home/kushal-mukherjee/Desktop/downloaded_new.zip'
+2025-10-02 17:01:23 [shared_files] registered: '2025201072_todoapp.zip' -> '/home/kushal-mukherjee/Desktop/downloaded_new.zip'
+2025-10-02 17:01:23 [auto-upload] re-login OK for user kushal
+
+2025-10-02 17:01:23 [auto-upload] tracker replied: OK upload_registered
+
+2025-10-02 17:03:58 [debug] peer entry: owner='alice' addr='127.0.0.1:5002'
+2025-10-02 17:03:58 [debug] peer entry: owner='kushal' addr='127.0.0.1:5004'
+2025-10-02 17:03:58 [shared_files] registered: '2025201072_todoapp.zip' -> '/home/kushal-mukherjee/Desktop/downloaded_new2.zip'
+2025-10-02 17:03:58 [shared_files] registered: '2025201072_todoapp.zip' -> '/home/kushal-mukherjee/Desktop/downloaded_new2.zip'
+2025-10-02 17:03:58 [auto-upload] re-login OK for user kingshook
+
+2025-10-02 17:03:58 [auto-upload] tracker replied: OK upload_registered
+
+2025-10-02 17:50:08 [shared_files] registered: '2025201072_todoapp.zip' -> '/home/kushal-mukherjee/Desktop/2025201072_todoapp.zip'
+2025-10-02 17:50:08 [shared_files] registered: 'alice:2025201072_todoapp.zip' -> '/home/kushal-mukherjee/Desktop/2025201072_todoapp.zip'
+2025-10-02 17:51:15 [debug] peer entry: owner='alice' addr='127.0.0.1:5002'
+2025-10-02 17:51:15 [shared_files] registered: '2025201072_todoapp.zip' -> '/home/kushal-mukherjee/Desktop/kushal.zip'
+2025-10-02 17:51:15 [shared_files] registered: '2025201072_todoapp.zip' -> '/home/kushal-mukherjee/Desktop/kushal.zip'
+2025-10-02 17:51:16 [auto-upload] re-login OK for user kushal
+
+2025-10-02 17:51:16 [auto-upload] tracker replied: OK upload_registered
+
+2025-10-02 17:55:25 [debug] peer entry: owner='alice' addr='127.0.0.1:5002'
+2025-10-02 17:55:25 [debug] peer entry: owner='kushal' addr='127.0.0.1:5050'
+2025-10-02 17:55:25 [shared_files] registered: '2025201072_todoapp.zip' -> '/home/kushal-mukherjee/Desktop/kingshook.zip'
+2025-10-02 17:55:25 [shared_files] registered: '2025201072_todoapp.zip' -> '/home/kushal-mukherjee/Desktop/kingshook.zip'
+2025-10-02 17:55:25  and 'kingshook:2025201072_todoapp.zip'
+2025-10-02 17:55:25 
+
+2025-10-02 17:55:25 [auto-upload] re-login OK for user kingshook
+
+2025-10-02 17:55:25 [auto-upload] tracker replied: OK upload_registered
+
