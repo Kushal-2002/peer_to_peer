@@ -428,16 +428,46 @@ void handle_logout(int fd, const vector<string> &args)
 // ---------------- file-operation handlers ----------------
 
 // get_manifest <group_id> <filename>
+<<<<<<< HEAD
 // reply:
 // OK manifest <filesize> <fullsha1> <num_pieces> <peer1,peer2,...> <piece1> <piece2> ...
 // or ERR no_such_file
+=======
+
+// reply:
+// OK manifest <filesize> <fullsha1> <num_pieces> <peer1,peer2,...> <piece1> <piece2> ...
+// or ERR no_such_file / ERR no_such_group / ERR login_required / ERR not_member
+>>>>>>> 053444a (download_background)
 void handle_get_manifest(int fd, const vector<string> &args) {
     if (args.size() < 3) { send_line(fd, "ERR missing_args"); return; }
     string gid = args[1], fname = args[2];
 
+<<<<<<< HEAD
     lock_guard<mutex> lg(group_files_mtx);
     auto it = group_files.find(gid);
     if (it == group_files.end()) { send_line(fd, "ERR no_such_group"); return; }
+=======
+    // require login
+    string cur = get_user_for_fd(fd);
+    if (cur.empty()) { send_line(fd, "ERR login_required"); return; }
+
+    // check group exists and membership
+    {
+        lock_guard<mutex> lg(groups_mtx);
+        auto git = groups.find(gid);
+        if (git == groups.end()) { send_line(fd, "ERR no_such_group"); return; }
+        Group &g = git->second;
+        if (g.members.find(cur) == g.members.end()) {
+            send_line(fd, "ERR not_member");
+            return;
+        }
+    }
+
+    // find the file manifest
+    lock_guard<mutex> lg(group_files_mtx);
+    auto it = group_files.find(gid);
+    if (it == group_files.end()) { send_line(fd, "ERR no_such_file"); return; }
+>>>>>>> 053444a (download_background)
 
     FileManifest *fm = nullptr;
     for (auto &m : it->second) {
@@ -456,6 +486,10 @@ void handle_get_manifest(int fd, const vector<string> &args) {
     send_line(fd, oss.str());
 }
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> 053444a (download_background)
 // upload_file <group_id> <filename> <filesize> <fullsha1> <num_pieces> <peer_token> <piece1> <piece2> ...
 void handle_upload_file(int fd, const vector<string> &args)
 {
@@ -567,8 +601,26 @@ void handle_download_file(int fd, const vector<string> &args)
 {
     if (args.size() < 4) { send_line(fd, "ERR missing_args"); return; }
     string gid = args[1], fname = args[2], dest = args[3];
+
+    // require login
     string cur = get_user_for_fd(fd);
     if (cur.empty()) { send_line(fd, "ERR login_required"); return; }
+<<<<<<< HEAD
+=======
+
+    // check group exists and membership
+    {
+        lock_guard<mutex> lg(groups_mtx);
+        auto git = groups.find(gid);
+        if (git == groups.end()) { send_line(fd, "ERR no_such_group"); return; }
+        Group &g = git->second;
+        if (g.members.find(cur) == g.members.end()) {
+            send_line(fd, "ERR not_member");
+            return;
+        }
+    }
+
+>>>>>>> 053444a (download_background)
     vector<string> peer_entries;
     {
         lock_guard<mutex> lg(group_files_mtx);
@@ -588,6 +640,10 @@ void handle_download_file(int fd, const vector<string> &args)
     send_line(fd, out);
 }
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> 053444a (download_background)
 void handle_show_downloads(int fd, const vector<string> &args) { (void)args; send_line(fd, "OK (no_downloads)"); }
 
 void handle_stop_share(int fd, const vector<string> &args)
