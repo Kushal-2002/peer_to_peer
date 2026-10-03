@@ -906,6 +906,18 @@ bool open_and_replay_journal(const string &path)
         while (pos < content.size())
         {
             size_t eol = content.find('\n', pos);
+            if (eol == string::npos)
+            {
+                // The truncation above should have removed any unterminated
+                // tail, so this is unreachable in practice. It is guarded
+                // anyway because the consequence is severe: `pos = eol + 1`
+                // would wrap npos round to 0 and replay the whole journal in
+                // an endless loop, hanging the tracker at startup rather than
+                // failing. Defence in depth for the recovery path.
+                cerr << "[journal] unterminated tail at offset " << pos
+                     << "; stopping replay\n";
+                break;
+            }
             string line = content.substr(pos, eol - pos);
             pos = eol + 1;
             if (!line.empty() && line.back() == '\r')

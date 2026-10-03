@@ -536,6 +536,62 @@ contains the command dispatcher, the journal, and the replication threads.
 
 ---
 
+## Tests
+
+```bash
+# Linux
+g++ -std=gnu++17 -O2 -Wall -Wextra tests/test_journal.cpp \
+    -o tests/test_journal -pthread -lssl -lcrypto && ./tests/test_journal
+
+# macOS
+OSSL=$(brew --prefix openssl@3)
+g++ -std=gnu++17 -O2 -Wall -Wextra tests/test_journal.cpp \
+    -o tests/test_journal -I"$OSSL/include" -L"$OSSL/lib" \
+    -pthread -lssl -lcrypto && ./tests/test_journal
+```
+
+19 tests, 86 assertions, covering the journal — the code the crash-consistency
+claim rests on. Replay rebuilding users, groups, membership and file manifests;
+torn-record detection and truncation; append-after-truncation; deduplication;
+CRLF, blank, unknown and malformed records; a full crash-and-restart cycle; and
+durability of an append.
+
+`tracker.cpp` is one translation unit with its own `main()`, so the test
+includes it with `main` renamed aside. That gives the tests the real functions
+and real global state with no refactor, and no sockets, ports or timing.
+
+### What the suite is checked against
+
+A passing suite proves nothing unless it can fail, so each test was validated by
+deliberately breaking the code and confirming the tests notice:
+
+| Mutation | Result |
+|---|---|
+| Skip truncating the torn tail | caught — 6 assertions fail |
+| Stop deduplicating identical records | caught — 2 assertions fail |
+| Never reopen the journal for append | caught |
+| Drop `wire_decode` on replayed filenames | caught |
+| Remove the `npos` replay guard | *not* caught — unreachable while truncation works, so the mutation is equivalent |
+
+That exercise found a real latent bug. The replay loop advances with
+`pos = eol + 1`; with no trailing newline `find` returns `npos`, so `pos` wraps
+to **0** and the loop replays the journal endlessly — a torn journal would have
+hung the tracker at startup rather than failing. Truncation was the only thing
+preventing it. The loop now checks for `npos` explicitly and stops with a
+diagnostic, verified by disabling truncation *and* the resize together: that
+combination hung before the guard and now exits in under a second.
+
+### Not covered
+
+- **`fsync` cannot be verified in-process.** Whether the data reached the
+  platter is invisible to a test in the same process — the page cache serves the
+  read either way. Proving it needs process-kill or block-layer fault injection.
+- Only the journal is covered. The piece scheduler, the peer protocol and the
+  TLS and token paths have no unit tests; they are exercised by `bench.py` and
+  by hand.
+
+---
+
 ## Known limitations
 
 Honest about what this does and does not do:
