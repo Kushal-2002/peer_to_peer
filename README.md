@@ -6,7 +6,7 @@ downloaded in parallel from multiple peers at once. A replicated metadata tracke
 handles authentication, group membership and peer discovery over TLS — but never
 carries file data.
 
-No external frameworks. ~4,500 lines of C++ across two binaries, plus a Python
+No external frameworks. ~4,900 lines of C++ across two binaries, plus a Python
 benchmark harness that drives the real processes.
 
 ---
