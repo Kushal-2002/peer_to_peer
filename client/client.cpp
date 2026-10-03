@@ -56,7 +56,11 @@ static const size_t PIECE_SIZE = 512 * 1024;
 
 // current logged-in user for this client process (set on login)
 string current_user;
-string current_pass;
+// Signed session token from the tracker, used to authenticate the extra
+// connections that background threads open. It replaces holding the user's
+// plaintext password for the life of the process: the password is used once,
+// during login, and never retained.
+string current_token;
 
 mutex current_user_mtx;
 
@@ -1692,24 +1696,36 @@ static bool tracker_announce(const vector<string> &trackers, int start_idx,
         return false;
     }
 
-    string user, pass;
+    // Authenticate with the session token issued at login, not the password.
+    // The token is signed by a secret every tracker shares, so it verifies on
+    // whichever tracker answered - and verification is a hash check rather
+    // than the 100k-iteration key derivation that `login` performs.
+    string user, token;
     {
         lock_guard<mutex> lg(current_user_mtx);
         user = current_user;
-        pass = current_pass;
+        token = current_token;
     }
-    if (user.empty() || pass.empty())
+    if (user.empty() || token.empty())
     {
-        log_to_file_sync("[announce] no stored credentials, cannot authenticate");
+        log_to_file_sync("[announce] no session token, cannot authenticate");
         conn_close(tsock);
         return false;
     }
 
     string lrep;
-    if (!send_line(tsock, "login " + user + " " + pass) || !recv_line(tsock, lrep) ||
+    if (!send_line(tsock, "auth " + token) || !recv_line(tsock, lrep) ||
         lrep.rfind("OK", 0) != 0)
     {
-        log_to_file_sync("[announce] re-login failed: " + lrep);
+        log_to_file_sync("[announce] token auth failed: " + lrep);
+        // An expired or rejected token is not recoverable here: there is no
+        // password to fall back on, by design. Clear it so the REPL can tell
+        // the user to log in again rather than retrying silently forever.
+        if (lrep.rfind("ERR invalid_token", 0) == 0)
+        {
+            lock_guard<mutex> lg(current_user_mtx);
+            current_token.clear();
+        }
         conn_close(tsock);
         return false;
     }
@@ -2283,29 +2299,34 @@ int main(int argc, char **argv)
                         int tsock = connect_any_tracker(trackers_copy, last_try_copy, tidx);
                         if (tsock >= 0) {
                             bool authenticated = false;
-                            string saved_user, saved_pass;
+                            string saved_user, saved_token;
                             {
                                 lock_guard<mutex> lg(current_user_mtx);
                                 saved_user = current_user;
-                                saved_pass = current_pass;
+                                saved_token = current_token;
                             }
-                            if (!saved_user.empty() && !saved_pass.empty()) {
-                                // try to login on this new socket
-                                string login_cmd = string("login ") + saved_user + " " + saved_pass;
-                                if (send_line(tsock, login_cmd)) {
+                            if (!saved_user.empty() && !saved_token.empty()) {
+                                // Authenticate this fresh socket with the session
+                                // token instead of replaying the password.
+                                string auth_cmd = string("auth ") + saved_token;
+                                if (send_line(tsock, auth_cmd)) {
                                     string lrep;
                                     if (recv_line(tsock, lrep)) {
                                         if (lrep.rfind("OK", 0) == 0) {
                                             authenticated = true;
-                                            log_to_file_sync( "[auto-upload] re-login OK for user " + saved_user +"\n");
+                                            log_to_file_sync( "[auto-upload] token auth OK for user " + saved_user +"\n");
                                         } else {
-                                            log_to_file_sync( "[auto-upload] re-login failed: " + lrep + "\n");
+                                            log_to_file_sync( "[auto-upload] token auth failed: " + lrep + "\n");
+                                            if (lrep.rfind("ERR invalid_token", 0) == 0) {
+                                                lock_guard<mutex> lg(current_user_mtx);
+                                                current_token.clear();
+                                            }
                                         }
                                     } else {
-                                        log_to_file_sync("[auto-upload] no reply to re-login\n");
+                                        log_to_file_sync("[auto-upload] no reply to token auth\n");
                                     }
                                 } else {
-                                    log_to_file_sync("[auto-upload] failed to send re-login\n");
+                                    log_to_file_sync("[auto-upload] failed to send token auth\n");
                                 }
                             } else {
                                 // no saved credentials; cannot re-login. We could still try upload but tracker will reject.
@@ -2445,13 +2466,24 @@ int main(int argc, char **argv)
             {
                 if (resp.rfind("OK", 0) == 0)
                 {
+                    // Reply is "OK logged_in <token>". Keep the token, discard
+                    // the password - nothing after this point needs it.
+                    string issued;
+                    {
+                        istringstream rs(resp);
+                        string ok, what;
+                        rs >> ok >> what >> issued;
+                    }
                     {
                         lock_guard<mutex> lg(current_user_mtx);
                         current_user = login_user;
-                        current_pass = login_pass; // store password for auto-relogin
+                        current_token = issued;
                     }
                     logged_in = true;
                     cout << "[info] login successful for user '" << login_user << "'.\n";
+                    if (issued.empty())
+                        cout << "[warn] tracker issued no session token; background\n"
+                                "       announces (upload/download completion) will fail.\n";
                 }
                 else
                 {
@@ -2459,7 +2491,7 @@ int main(int argc, char **argv)
                     {
                         lock_guard<mutex> lg(current_user_mtx);
                         current_user.clear();
-                        current_pass.clear();
+                        current_token.clear();
                     }
                     logged_in = false;
                 }

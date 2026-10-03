@@ -139,6 +139,39 @@ and encrypting bulk transfer would add CPU cost to the download path for no
 confidentiality gain. The tracker-to-tracker sync link is also still plaintext —
 see [Known limitations](#known-limitations).
 
+### Session tokens
+
+A session used to be identified by the socket it was created on
+(`sessions[fd] = user`). That had two consequences. A client's background threads
+open their own connections, so to authenticate them the client had to keep the
+user's **plaintext password in memory** for the life of the process. And every
+such connection re-ran the login path — meaning a full 100,000-iteration PBKDF2
+verification, a cost that exists to slow down password cracking, placed on a
+routine operation.
+
+Login now returns a signed token:
+
+```
+v1:<username-hex>:<expiry-unix>:<hmac-sha256-hex>
+```
+
+The token is **stateless**. It carries the username and an expiry, authenticated
+by an HMAC over both using a secret shared by every tracker (`session.key`,
+generated on first run). Verification recomputes the HMAC and compares in
+constant time, so no tracker stores the token, replicates it, or writes it to the
+journal. That last point is what makes it work: a client's background announces
+round-robin across trackers, so a token issued by one must be accepted by the
+other — and a signature achieves that without any shared state at all.
+
+The client keeps the token and discards the password after login. Fresh
+connections send `auth <token>` instead of `login <user> <pass>`, turning a
+deliberately slow key derivation into a hash comparison.
+
+The trade-off is the same one JWTs make: a token cannot be withdrawn before it
+expires, because nothing is looked up to validate it. `logout` records the token
+in an in-memory revocation set, which is per-tracker and lost on restart. Expiry
+(12 hours by default) is the real bound; revocation is best-effort.
+
 ---
 
 ## Build
@@ -189,7 +222,9 @@ The `subjectAltName` matters: without it the client cannot verify the hostname
 and falls back to encryption without authentication.
 
 Neither file is committed — the key is secret, and the certificate is per
-deployment. Override the paths with `TRACKER_TLS_CERT` / `TRACKER_TLS_KEY` on the
+deployment. The same applies to `session.key`, which the tracker generates on
+first run and which **must be identical on every tracker**; copy it across, or
+override the path with `TRACKER_SESSION_KEY`. Override the paths with `TRACKER_TLS_CERT` / `TRACKER_TLS_KEY` on the
 tracker and `TRACKER_TLS_CA` on the client.
 
 Behaviour when files are missing is deliberately asymmetric. The tracker falls
@@ -280,7 +315,8 @@ first one lands.
 | Command | Description |
 |---|---|
 | `create_user <user> <pass>` | Register. Password is hashed at the tracker. |
-| `login <user> <pass>` | Authenticate on this connection. |
+| `login <user> <pass>` | Authenticate; returns a session token. |
+| `auth <token>` | Authenticate a connection with a token instead of a password. Used by the client's background threads. |
 | `logout` | End the session. |
 | `create_group <gid>` | Create a group; you become its owner. |
 | `join_group <gid>` | Request membership (owner must approve). |
@@ -341,30 +377,36 @@ scaling (fixed seeders, concurrent downloaders), and a centralized single-source
 TCP baseline written inside the harness for comparison. Results print and are
 written to `results.csv`.
 
-### Measured — 16 MB file, 3 trials averaged, loopback, single machine
+### Measured — 16 MB file, 6 trials averaged, loopback, single machine
 
 Peer scaling, one downloader:
 
-| Seeders | Time | Throughput | vs. 1 seeder |
+| Seeders | Mean | Range | vs. 1 seeder |
 |---|---|---|---|
-| 1 | 0.073 s | 219.76 MB/s | — |
-| 2 | 0.050 s | 319.58 MB/s | **1.45×** |
-| 4 | 0.050 s | 321.21 MB/s | 1.46× (no further gain) |
+| 1 | 241.75 MB/s | 219.8 – 259.7 | — |
+| 2 | 431.37 MB/s | 423.7 – 444.1 | **1.78×** |
+| 4 | 429.14 MB/s | 422.4 – 444.2 | 1.78× (no further gain) |
 
-**Adding a second seeder makes the download about 1.45× faster**, which is the multi-peer
-path doing what it is designed to do. Going from two to four adds nothing — on a
-single machine every seeder reads the same file from the same disk, so the
-bottleneck moves from peer availability to that one device. On separate hosts with
-independent disks the curve would be expected to keep rising.
+**A second seeder makes the download 1.78× faster.** A third and fourth add
+nothing: on a single machine every seeder reads the same file from the same disk,
+so two are enough to saturate it and the bottleneck moves from peer availability
+onto that device. On separate hosts with independent disks the curve would be
+expected to keep rising.
 
-A note on methodology: these are averages over three trials. At smaller sizes
-(~2 MB, four pieces, sub-30 ms transfers) run-to-run variance exceeds the effect
-being measured, and single trials there can show two seeders as *slower* than one.
-Any claim about scaling needs both a large enough file and repeated trials.
+A note on methodology, because it changed the answer twice. An early measurement
+at 2 MB in a single trial suggested 1.5×; at that size the file is four pieces and
+the transfer takes under 30 ms, so run-to-run variance exceeds the effect, and a
+later single trial at the same size showed two seeders as marginally *slower*.
+Moving to 16 MB and three trials gave 1.45×, then six trials gave 1.78× — the
+three-trial sample had caught a low outlier. The spread above shows why: the
+one-seeder figure varies by 16.5% run to run while the two-seeder figure varies by
+under 5%, so the single-source case is the noisy one and needs the most repeats.
+Any scaling claim here needs both a large enough file and enough trials to see
+past that.
 
-For comparison, the centralized baseline reached ~2,410 MB/s with one downloader
-and ~1,284 MB/s with four. **It still wins in absolute terms at 16 MB, by roughly
-7×**, for three reasons worth being explicit about: all peers share one disk and
+For comparison, the centralized baseline reached ~2,600 MB/s with one downloader
+and ~1,800 MB/s with two. **It still wins in absolute terms at 16 MB, by roughly
+6×**, for three reasons worth being explicit about: all peers share one disk and
 one set of cores, so the swarm cannot contribute independent bandwidth; the
 baseline does a single sequential read with no chunking and no hashing, so it pays
 none of the per-piece integrity cost; and there is no network latency on loopback,
@@ -431,8 +473,14 @@ Honest about what this does and does not do:
 - **Thread per connection.** Simple and correct, but one OS thread per connection
   does not scale to thousands of peers; an event loop with a small thread pool
   would.
-- **Sessions are keyed by socket**, so background operations must reconnect and
-  re-authenticate. A session token would decouple the two.
+- **Session tokens cannot be revoked before expiry.** Validation is a signature
+  check with no lookup, so `logout` can only add the token to an in-memory,
+  per-tracker revocation set that is lost on restart. A token logged out on one
+  tracker still verifies on the other until it expires. Shortening the TTL or
+  replicating revocations would tighten this.
+- **The token signing secret must be copied between trackers by hand.** A tracker
+  without the shared `session.key` rejects every token the other issued, and the
+  failure is silent from the client's side beyond an `ERR invalid_token`.
 - **Single-machine testing only.** Everything runs over `127.0.0.1`, so no result
   here reflects real network latency, packet loss or NIC contention. No NAT
   traversal or DHT.

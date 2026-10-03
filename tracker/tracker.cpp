@@ -26,8 +26,11 @@
 #include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
+
+#include <ctime>
 using namespace std; 
 // ...
 std::atomic<bool> running{true};
@@ -241,6 +244,213 @@ bool verify_password(const string &encoded, const string &plaintext)
                           (int)got.size(), got.data()) != 1)
         return false;
     return CRYPTO_memcmp(got.data(), expected.data(), got.size()) == 0;
+}
+
+// ---------------- session tokens ----------------
+//
+// A session used to be identified by the socket it logged in on, which meant a
+// client holding a background thread had to keep the user's plaintext password
+// in memory so it could log in again on a fresh connection. That put a
+// deliberately slow key derivation (100k PBKDF2 iterations) on a routine path,
+// and kept a password resident for the life of the process.
+//
+// Instead a successful login issues a signed token. The token is *stateless*:
+// it carries the username and an expiry, and is authenticated by an HMAC over
+// both using a secret shared by every tracker. Verification recomputes the HMAC,
+// so no tracker has to store the token, replicate it, or write it to the
+// journal - which matters because a client's background announces round-robin
+// across trackers and must work on whichever one answers.
+//
+// Format: v1:<uid-hex>:<expiry-unix>:<hmac-hex>
+//
+// The trade-off, which is the same one JWTs make: a token cannot be withdrawn
+// before it expires, because nothing is looked up. `logout` therefore records
+// the token in an in-memory revocation set, which is per-tracker and lost on
+// restart. Expiry is the real bound; revocation is best-effort.
+
+static const long SESSION_TTL_SECONDS = 12 * 60 * 60;
+static const size_t SESSION_SECRET_LEN = 32;
+
+vector<unsigned char> g_session_secret;
+unordered_set<string> revoked_tokens;
+mutex revoked_tokens_mtx;
+
+// fd -> the token that authenticated it, so logout knows what to revoke.
+unordered_map<int, string> fd_token;
+mutex fd_token_mtx;
+
+// Loads the shared signing secret, generating it on first run. Every tracker
+// must use the SAME file contents, otherwise a token issued by one is rejected
+// by the other and failover silently stops working.
+static bool session_secret_init(const string &path)
+{
+    // Two trackers started at the same moment will both find the file absent
+    // and both try to create it. O_EXCL means exactly one wins; the loser falls
+    // back to reading what the winner wrote. Without the retry, the loser would
+    // start with no secret and silently reject every token the other issued.
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd >= 0)
+    {
+        vector<unsigned char> buf(SESSION_SECRET_LEN);
+        size_t got = 0;
+        while (got < buf.size())
+        {
+            ssize_t r = read(fd, buf.data() + got, buf.size() - got);
+            if (r < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                cerr << "[session] cannot read " << path << ": " << strerror(errno) << "\n";
+                close(fd);
+                return false;
+            }
+            if (r == 0)
+                break;
+            got += (size_t)r;
+        }
+        close(fd);
+        if (got == SESSION_SECRET_LEN)
+        {
+            g_session_secret = buf;
+            return true;
+        }
+        cerr << "[session] " << path << " is " << got << " bytes, expected "
+             << SESSION_SECRET_LEN << "; refusing to use it\n";
+        return false;
+    }
+    if (errno != ENOENT)
+    {
+        cerr << "[session] cannot open " << path << ": " << strerror(errno) << "\n";
+        return false;
+    }
+
+    // First run: generate one and persist it so a restart keeps issued tokens
+    // valid, and so a second tracker can be pointed at the same file.
+    vector<unsigned char> buf(SESSION_SECRET_LEN);
+    if (RAND_bytes(buf.data(), (int)buf.size()) != 1)
+    {
+        cerr << "[session] RAND_bytes failed\n";
+        return false;
+    }
+    int wfd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (wfd < 0)
+    {
+        if (errno == EEXIST)
+            continue; // another tracker just created it; loop round and read it
+        cerr << "[session] cannot create " << path << ": " << strerror(errno) << "\n";
+        return false;
+    }
+    size_t left = buf.size();
+    const unsigned char *p = buf.data();
+    while (left > 0)
+    {
+        ssize_t n = write(wfd, p, left);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            cerr << "[session] write failed: " << strerror(errno) << "\n";
+            close(wfd);
+            return false;
+        }
+        p += n;
+        left -= (size_t)n;
+    }
+    fsync(wfd);
+    close(wfd);
+    g_session_secret = buf;
+    cerr << "[session] generated a new signing secret at " << path << "\n"
+         << "[session] copy this file to every other tracker, or tokens issued\n"
+         << "[session] here will be rejected there\n";
+    return true;
+    } // end retry loop
+
+    cerr << "[session] could not establish a signing secret at " << path << "\n";
+    return false;
+}
+
+static string session_hmac(const string &payload)
+{
+    unsigned char mac[EVP_MAX_MD_SIZE];
+    unsigned int maclen = 0;
+    if (!HMAC(EVP_sha256(), g_session_secret.data(), (int)g_session_secret.size(),
+              (const unsigned char *)payload.data(), payload.size(), mac, &maclen))
+        return string();
+    return to_hex(mac, maclen);
+}
+
+static string make_session_token(const string &uid)
+{
+    if (g_session_secret.empty())
+        return string();
+    string payload = "v1:" + to_hex((const unsigned char *)uid.data(), uid.size()) +
+                     ":" + to_string((long)time(nullptr) + SESSION_TTL_SECONDS);
+    string mac = session_hmac(payload);
+    if (mac.empty())
+        return string();
+    return payload + ":" + mac;
+}
+
+// Returns true and fills `uid` when the token is well-formed, correctly signed,
+// unexpired and not revoked.
+static bool verify_session_token(const string &token, string &uid)
+{
+    if (g_session_secret.empty())
+        return false;
+
+    // Split off the trailing HMAC; everything before it is the signed payload.
+    size_t last = token.rfind(':');
+    if (last == string::npos)
+        return false;
+    string payload = token.substr(0, last);
+    string mac = token.substr(last + 1);
+
+    string expect = session_hmac(payload);
+    if (expect.empty() || expect.size() != mac.size())
+        return false;
+    // Constant-time: a byte-by-byte early exit would leak how much of a forged
+    // signature was correct.
+    if (CRYPTO_memcmp(expect.data(), mac.data(), expect.size()) != 0)
+        return false;
+
+    // payload == v1:<uid-hex>:<expiry>
+    size_t p1 = payload.find(':');
+    if (p1 == string::npos)
+        return false;
+    size_t p2 = payload.find(':', p1 + 1);
+    if (p2 == string::npos)
+        return false;
+    if (payload.compare(0, p1, "v1") != 0)
+        return false;
+
+    string uid_hex = payload.substr(p1 + 1, p2 - p1 - 1);
+    string exp_str = payload.substr(p2 + 1);
+
+    long expiry = 0;
+    try
+    {
+        expiry = stol(exp_str);
+    }
+    catch (...)
+    {
+        return false;
+    }
+    if ((long)time(nullptr) >= expiry)
+        return false; // expired
+
+    {
+        lock_guard<mutex> lg(revoked_tokens_mtx);
+        if (revoked_tokens.count(token))
+            return false;
+    }
+
+    vector<unsigned char> raw;
+    if (!from_hex(uid_hex, raw) || raw.empty())
+        return false;
+    uid.assign((const char *)raw.data(), raw.size());
+    return true;
 }
 
 // ---------------- socket helpers ----------------
@@ -505,8 +715,14 @@ string get_user_for_fd(int fd)
 }
 void cleanup_fd(int fd)
 {
-    lock_guard<mutex> lg(sessions_mtx);
-    sessions.erase(fd);
+    {
+        lock_guard<mutex> lg(sessions_mtx);
+        sessions.erase(fd);
+    }
+    // Drop the fd->token mapping too, otherwise it grows for the life of the
+    // process as connections come and go.
+    lock_guard<mutex> lg(fd_token_mtx);
+    fd_token.erase(fd);
 }
 
 // ---------------- journal helpers ----------------
@@ -735,7 +951,58 @@ void handle_login(int fd, const vector<string> &args)
         lock_guard<mutex> lg(sessions_mtx);
         sessions[fd] = uid;
     }
-    send_line(fd, "OK logged_in");
+
+    // Hand back a signed token so the client never has to keep the password
+    // around to authenticate a later connection.
+    string token = make_session_token(uid);
+    if (token.empty())
+    {
+        // No signing secret: the session is still valid on this socket, the
+        // client just cannot carry it to another connection.
+        send_line(fd, "OK logged_in");
+        return;
+    }
+    {
+        lock_guard<mutex> lg(fd_token_mtx);
+        fd_token[fd] = token;
+    }
+    send_line(fd, "OK logged_in " + token);
+}
+
+// auth <token> - authenticate a fresh connection with a token from a previous
+// login, instead of replaying the password. This is the path background threads
+// take, so it deliberately avoids the PBKDF2 verification that `login` does.
+void handle_auth(int fd, const vector<string> &args)
+{
+    if (args.size() < 2)
+    {
+        send_line(fd, "ERR missing_args");
+        return;
+    }
+    string uid;
+    if (!verify_session_token(args[1], uid))
+    {
+        send_line(fd, "ERR invalid_token");
+        return;
+    }
+    // The token proves who the user was; make sure they still exist.
+    {
+        lock_guard<mutex> lg(users_mtx);
+        if (!users.count(uid))
+        {
+            send_line(fd, "ERR invalid_token");
+            return;
+        }
+    }
+    {
+        lock_guard<mutex> lg(sessions_mtx);
+        sessions[fd] = uid;
+    }
+    {
+        lock_guard<mutex> lg(fd_token_mtx);
+        fd_token[fd] = args[1];
+    }
+    send_line(fd, "OK authed " + uid);
 }
 
 void handle_create_group(int fd, const vector<string> &args)
@@ -1018,6 +1285,22 @@ string apply_accept_request(const string &gid, const string &uid, const string &
 void handle_logout(int fd, const vector<string> &args)
 {
     (void)args;
+    // Withdraw the token that authenticated this connection, so it cannot be
+    // reused before its expiry. Best-effort: the revocation set is in memory
+    // and per-tracker, so a token logged out here still verifies on the other
+    // tracker until it expires. Stateless tokens buy failover at this cost.
+    string token;
+    {
+        lock_guard<mutex> lg(fd_token_mtx);
+        auto it = fd_token.find(fd);
+        if (it != fd_token.end())
+            token = it->second;
+    }
+    if (!token.empty())
+    {
+        lock_guard<mutex> lg(revoked_tokens_mtx);
+        revoked_tokens.insert(token);
+    }
     cleanup_fd(fd);
     send_line(fd, "OK logged_out");
 }
@@ -1415,6 +1698,8 @@ void dispatch_command(int fd, const vector<string> &tokens)
         handle_create_user(fd, tokens);
     else if (cmd == "login")
         handle_login(fd, tokens);
+    else if (cmd == "auth")
+        handle_auth(fd, tokens);
     else if (cmd == "create_group")
         handle_create_group(fd, tokens);
     else if (cmd == "join_group")
@@ -1808,6 +2093,21 @@ int main(int argc, char **argv)
     if (!open_and_replay_journal(journal_file))
         return 1;
     cerr << "[sync] journal holds " << journal_lines_set.size() << " record(s)\n";
+
+    // Load (or create) the token signing secret. Every tracker must share this
+    // file, or a token issued by one is rejected by the other.
+    {
+        const char *sk = getenv("TRACKER_SESSION_KEY");
+        string secret_path = sk ? sk : "session.key";
+        if (!session_secret_init(secret_path))
+        {
+            cerr << "[session] no signing secret; clients will have to log in\n"
+                 << "[session] with a password on every connection\n";
+        }
+        else
+            cerr << "[session] token signing enabled, secret " << secret_path
+                 << ", TTL " << (SESSION_TTL_SECONDS / 3600) << "h\n";
+    }
 
     // Bring up TLS before the listener, so no client can connect during a
     // window where the tracker would silently accept a plaintext password.
