@@ -1866,6 +1866,51 @@ static bool tracker_announce(const vector<string> &trackers, int start_idx,
     return rep.rfind("OK", 0) == 0;
 }
 
+// Re-authenticates a freshly opened tracker connection using the session token
+// from the original login.
+//
+// A tracker session is bound to the socket it was created on, so after a
+// failover the new socket is anonymous: the client reconnects successfully and
+// then every authenticated command fails with ERR login_required. Replaying the
+// token is exactly what it exists for, and it costs a single round trip instead
+// of a password re-entry.
+//
+// Returns false if there is no token, or the tracker rejected it - the caller
+// stays connected either way, since unauthenticated commands still work.
+static bool reauth_after_reconnect(int fd)
+{
+    if (fd < 0)
+        return false;
+    string token;
+    {
+        lock_guard<mutex> lg(current_user_mtx);
+        token = current_token;
+    }
+    if (token.empty())
+        return false; // never logged in, so nothing to restore
+
+    string rep;
+    if (!send_line(fd, "auth " + token) || !recv_line(fd, rep))
+    {
+        log_to_file_sync("[reauth] send/recv failed on the new connection");
+        return false;
+    }
+    if (rep.rfind("OK", 0) != 0)
+    {
+        log_to_file_sync("[reauth] tracker rejected the token: " + rep);
+        if (rep.rfind("ERR invalid_token", 0) == 0)
+        {
+            lock_guard<mutex> lg(current_user_mtx);
+            current_token.clear();
+        }
+        cout << "[warn] session could not be restored on the new tracker; "
+                "log in again.\n";
+        return false;
+    }
+    log_to_file_sync("[reauth] session restored on the new connection");
+    return true;
+}
+
 // Decodes the filenames in a tracker reply for display. Only replies that
 // actually carry filenames are touched, and each whitespace-separated token is
 // decoded on its own - list_files returns several names separated by spaces, so
@@ -2085,6 +2130,9 @@ int main(int argc, char **argv)
         if (sock >= 0)
         {
             cout << "Connected to tracker: " << trackers[connected_idx] << "\n";
+        // Restore the session on this new socket; see
+        // reauth_after_reconnect() for why this is needed.
+        reauth_after_reconnect(sock);
             logged_in = false;
             last_try = (connected_idx + 1) % (int)trackers.size();
             break;
@@ -2227,6 +2275,9 @@ int main(int argc, char **argv)
                 connected_idx = idx;
                 last_try = (connected_idx + 1) % (int)trackers.size();
                 cout << "Connected to tracker: " << trackers[connected_idx] << "\n";
+                // Restore the session on this new socket; see
+                // reauth_after_reconnect() for why this is needed.
+                reauth_after_reconnect(sock);
             }
 
             string cmd = "stop_share " + gid + " " + wire_encode(fname);
@@ -2651,6 +2702,9 @@ int main(int argc, char **argv)
                 }
                 connected_idx = idx;
                 cout << "Connected to tracker: " << trackers[connected_idx] << "\n";
+                // Restore the session on this new socket; see
+                // reauth_after_reconnect() for why this is needed.
+                reauth_after_reconnect(sock);
                 last_try = (connected_idx + 1) % (int)trackers.size();
             }
 

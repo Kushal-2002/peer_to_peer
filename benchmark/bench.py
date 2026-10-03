@@ -183,9 +183,12 @@ def stop_trackers(procs, journal_dir=None):
 class ClientProc:
     """Drives one `client` subprocess through its interactive '> ' prompt."""
 
-    def __init__(self, port, label):
+    def __init__(self, port, label, tracker_info=None):
         self.port = port
         self.label = label
+        # Tests sometimes need a client pinned to one specific tracker, which
+        # is done by handing it a tracker list containing only that address.
+        self.tracker_info = tracker_info or TRACKER_INFO
         self.workdir = tempfile.mkdtemp(prefix=f"bench_client_{label}_")
         # Each client runs in its own scratch directory so their client.log
         # files don't collide, which means the tracker's certificate is not on
@@ -196,7 +199,7 @@ class ClientProc:
         if os.path.exists(ca):
             env["TRACKER_TLS_CA"] = ca
         self.proc = subprocess.Popen(
-            [CLIENT_BIN, f"127.0.0.1:{port}", TRACKER_INFO],
+            [CLIENT_BIN, f"127.0.0.1:{port}", self.tracker_info],
             cwd=self.workdir,
             env=env,
             stdin=subprocess.PIPE,

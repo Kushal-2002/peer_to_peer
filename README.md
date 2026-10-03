@@ -550,6 +550,10 @@ g++ -std=gnu++17 -O2 -Wall -Wextra tests/test_journal.cpp \
     -pthread -lssl -lcrypto && ./tests/test_journal
 ```
 
+Two suites.
+
+### Journal — `tests/test_journal.cpp`
+
 19 tests, 86 assertions, covering the journal — the code the crash-consistency
 claim rests on. Replay rebuilding users, groups, membership and file manifests;
 torn-record detection and truncation; append-after-truncation; deduplication;
@@ -581,14 +585,52 @@ preventing it. The loop now checks for `npos` explicitly and stops with a
 diagnostic, verified by disabling truncation *and* the resize together: that
 combination hung before the guard and now exits in under a second.
 
+### Integration — `tests/test_integration.py`
+
+```bash
+python3 tests/test_integration.py            # all five
+python3 tests/test_integration.py -k repl    # one, by name
+python3 tests/test_integration.py -v         # stream client I/O
+```
+
+Five scenarios that exercise claims nothing previously verified. The client is
+an interactive REPL, so these drive it the way `bench.py` does — spawn it with
+pipes and read its output up to the `> ` prompt before sending the next command,
+so there are no sleeps and no guessing.
+
+| Scenario | What it proves |
+|---|---|
+| Replication | a user and group created via tracker 0 are usable via tracker 1 — each client is pinned to one tracker with a single-line tracker list |
+| Partial-share seeding | a peer is advertised as a seeder *while its own download is still running* |
+| Corrupt pieces | with a lying seeder as the only source the download must fail; with an honest peer also present it completes with correct bytes |
+| Peer loss | a seeder is `SIGKILL`ed mid-transfer and the download still completes from the survivor |
+| Tracker failover | the tracker in use is killed and the client keeps working, still authenticated |
+
+Two of these were written to fail first. The corrupt-piece test's strong half is
+the *only-a-liar* case, because peer selection has no honest alternative to fall
+back on — if it reported success, verification would not be working. And the
+failover test is probed with `create_group` rather than `list_groups`, because
+`list_groups` has no login check and would have passed without testing
+authentication at all.
+
+The failover test found a real bug. A tracker session is bound to the socket it
+was created on, so after reconnecting to the surviving tracker the client was
+anonymous: every authenticated command failed with `ERR login_required` until
+the user logged in again by hand. Replaying the session token on the new
+connection is exactly what the token is for, and it is now done at all three
+reconnect points. Verified by removing the fix and watching the test fail again.
+
 ### Not covered
 
 - **`fsync` cannot be verified in-process.** Whether the data reached the
   platter is invisible to a test in the same process — the page cache serves the
   read either way. Proving it needs process-kill or block-layer fault injection.
-- Only the journal is covered. The piece scheduler, the peer protocol and the
-  TLS and token paths have no unit tests; they are exercised by `bench.py` and
-  by hand.
+- No unit tests below the integration level for the piece scheduler or the peer
+  protocol. Their behaviour is covered end to end by the integration suite, but
+  the command handlers live inside the REPL loop in `client.cpp`, so they cannot
+  be called directly the way the journal functions can.
+- Token expiry (12h) is untested — it would need the TTL made overridable.
+- Split-brain divergence is documented but never reproduced in a test.
 
 ---
 

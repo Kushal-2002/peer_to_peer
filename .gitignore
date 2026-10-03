@@ -40,3 +40,4 @@ __pycache__/
 # demo launcher runtime state
 .demo/
 tests/test_journal
+tests/__pycache__/
