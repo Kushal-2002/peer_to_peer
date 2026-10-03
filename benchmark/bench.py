@@ -187,9 +187,18 @@ class ClientProc:
         self.port = port
         self.label = label
         self.workdir = tempfile.mkdtemp(prefix=f"bench_client_{label}_")
+        # Each client runs in its own scratch directory so their client.log
+        # files don't collide, which means the tracker's certificate is not on
+        # their relative path. Point them at it explicitly so the tracker
+        # connection is verified rather than falling back to unverified TLS.
+        env = os.environ.copy()
+        ca = os.path.join(CLIENT_DIR, "server.crt")
+        if os.path.exists(ca):
+            env["TRACKER_TLS_CA"] = ca
         self.proc = subprocess.Popen(
             [CLIENT_BIN, f"127.0.0.1:{port}", TRACKER_INFO],
             cwd=self.workdir,
+            env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL if not VERBOSE else None,

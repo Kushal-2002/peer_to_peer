@@ -4,6 +4,15 @@ client/client
 *.o
 *.out
 
+# ---- TLS material ----
+# The private key must never be committed. The certificate is public, but it is
+# generated per deployment, so it is not committed either - the README documents
+# the openssl command that creates both.
+*.key
+*.crt
+*.pem
+*.csr
+
 # ---- runtime state ----
 *.journal
 *.part

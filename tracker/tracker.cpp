@@ -24,8 +24,10 @@
 #include <fcntl.h>
 
 #include <openssl/crypto.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <openssl/ssl.h>
 using namespace std; 
 // ...
 std::atomic<bool> running{true};
@@ -242,21 +244,170 @@ bool verify_password(const string &encoded, const string &plaintext)
 }
 
 // ---------------- socket helpers ----------------
+// ---------------- TLS for client connections ----------------
+//
+// Client sessions are encrypted because `login` and `create_user` carry a
+// plaintext password; hashing protects the stored credential, not the wire.
+//
+// The tracker-to-tracker sync link stays plaintext deliberately. It carries
+// PBKDF2 credentials rather than plaintext passwords, and a sync connection has
+// one thread writing broadcasts while another reads inbound records — sharing a
+// single SSL object between a concurrent reader and writer is not safe without
+// further restructuring. See the limitations section of the README.
+//
+// Connections are keyed by file descriptor so every existing call site
+// (`sessions[fd]`, `send_line(fd, ...)`, `peer_fds`) keeps working unchanged:
+// the I/O helpers below look up whether a given fd has TLS attached and pick
+// SSL_read/SSL_write or recv/send accordingly.
+
+SSL_CTX *g_tls_ctx = nullptr; // null => TLS unavailable, tracker is plaintext-only
+
+unordered_map<int, SSL *> ssl_by_fd;
+mutex ssl_by_fd_mtx;
+
+static SSL *ssl_for(int fd)
+{
+    lock_guard<mutex> lg(ssl_by_fd_mtx);
+    auto it = ssl_by_fd.find(fd);
+    return (it == ssl_by_fd.end()) ? nullptr : it->second;
+}
+
+static void ssl_attach(int fd, SSL *ssl)
+{
+    lock_guard<mutex> lg(ssl_by_fd_mtx);
+    ssl_by_fd[fd] = ssl;
+}
+
+// Tears down the TLS session for this fd, if any, and closes the socket.
+// Safe to call on a plaintext fd.
+static void conn_close(int fd)
+{
+    SSL *ssl = nullptr;
+    {
+        lock_guard<mutex> lg(ssl_by_fd_mtx);
+        auto it = ssl_by_fd.find(fd);
+        if (it != ssl_by_fd.end())
+        {
+            ssl = it->second;
+            ssl_by_fd.erase(it);
+        }
+    }
+    if (ssl)
+    {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+    }
+    if (fd >= 0)
+        close(fd);
+}
+
+static void tls_log_errors(const char *what)
+{
+    unsigned long e;
+    bool any = false;
+    while ((e = ERR_get_error()) != 0)
+    {
+        char buf[256];
+        ERR_error_string_n(e, buf, sizeof(buf));
+        cerr << "[tls] " << what << ": " << buf << "\n";
+        any = true;
+    }
+    if (!any)
+        cerr << "[tls] " << what << ": (no detail)\n";
+}
+
+// Builds the server context from a certificate/key pair. Returns false when the
+// files are absent or unusable; the caller then runs without TLS rather than
+// refusing to start, so an existing plaintext setup is not broken by upgrading.
+static bool tls_server_init(const string &cert_path, const string &key_path)
+{
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx)
+    {
+        tls_log_errors("SSL_CTX_new failed");
+        return false;
+    }
+    // TLS 1.2 is the floor: everything below it has known weaknesses, and
+    // nothing here needs to interoperate with old clients.
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+
+    if (SSL_CTX_use_certificate_file(ctx, cert_path.c_str(), SSL_FILETYPE_PEM) != 1)
+    {
+        tls_log_errors(("cannot load certificate " + cert_path).c_str());
+        SSL_CTX_free(ctx);
+        return false;
+    }
+    if (SSL_CTX_use_PrivateKey_file(ctx, key_path.c_str(), SSL_FILETYPE_PEM) != 1)
+    {
+        tls_log_errors(("cannot load private key " + key_path).c_str());
+        SSL_CTX_free(ctx);
+        return false;
+    }
+    if (SSL_CTX_check_private_key(ctx) != 1)
+    {
+        tls_log_errors("certificate and private key do not match");
+        SSL_CTX_free(ctx);
+        return false;
+    }
+    g_tls_ctx = ctx;
+    return true;
+}
+
+// Completes a TLS handshake on an already-accepted socket. On failure the fd is
+// left for the caller to close.
+static bool tls_accept(int fd)
+{
+    if (!g_tls_ctx)
+        return false;
+    SSL *ssl = SSL_new(g_tls_ctx);
+    if (!ssl)
+    {
+        tls_log_errors("SSL_new failed");
+        return false;
+    }
+    SSL_set_fd(ssl, fd);
+    if (SSL_accept(ssl) != 1)
+    {
+        tls_log_errors("handshake failed");
+        SSL_free(ssl);
+        return false;
+    }
+    ssl_attach(fd, ssl);
+    return true;
+}
+
 bool send_all(int fd, const string &s)
 {
+    SSL *ssl = ssl_for(fd);
     const char *p = s.data();
     size_t left = s.size();
     while (left > 0)
     {
-        ssize_t n = send(fd, p, left, 0);
-        if (n < 0)
+        ssize_t n;
+        if (ssl)
         {
-            if (errno == EINTR)
-                continue;
-            return false;
+            int w = SSL_write(ssl, p, (int)left);
+            if (w <= 0)
+            {
+                int err = SSL_get_error(ssl, w);
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+                    continue;
+                return false;
+            }
+            n = w;
         }
-        if (n == 0)
-            return false;
+        else
+        {
+            n = send(fd, p, left, 0);
+            if (n < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                return false;
+            }
+            if (n == 0)
+                return false;
+        }
         p += n;
         left -= n;
     }
@@ -271,19 +422,36 @@ bool send_line(int fd, const string &line)
 }
 bool recv_line(int fd, string &out)
 {
+    SSL *ssl = ssl_for(fd);
     out.clear();
     char c;
     while (true)
     {
-        ssize_t r = recv(fd, &c, 1, 0);
-        if (r < 0)
+        ssize_t r;
+        if (ssl)
         {
-            if (errno == EINTR)
-                continue;
-            return false;
+            int rd = SSL_read(ssl, &c, 1);
+            if (rd <= 0)
+            {
+                int err = SSL_get_error(ssl, rd);
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+                    continue;
+                return false; // closed or fatal
+            }
+            r = rd;
         }
-        if (r == 0)
-            return false; // closed
+        else
+        {
+            r = recv(fd, &c, 1, 0);
+            if (r < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                return false;
+            }
+            if (r == 0)
+                return false; // closed
+        }
         if (c == '\n')
             break;
         if (c == '\r')
@@ -1641,6 +1809,27 @@ int main(int argc, char **argv)
         return 1;
     cerr << "[sync] journal holds " << journal_lines_set.size() << " record(s)\n";
 
+    // Bring up TLS before the listener, so no client can connect during a
+    // window where the tracker would silently accept a plaintext password.
+    // A missing certificate is not fatal: the tracker falls back to plaintext
+    // and says so loudly, rather than refusing to start.
+    {
+        const char *cert_env = getenv("TRACKER_TLS_CERT");
+        const char *key_env = getenv("TRACKER_TLS_KEY");
+        string cert_path = cert_env ? cert_env : "server.crt";
+        string key_path = key_env ? key_env : "server.key";
+
+        if (tls_server_init(cert_path, key_path))
+            cerr << "[tls] enabled, certificate " << cert_path << "\n";
+        else
+        {
+            cerr << "[tls] DISABLED - running plaintext. Passwords will cross the\n"
+                 << "[tls] network in the clear. Generate a certificate with:\n"
+                 << "[tls]   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \\\n"
+                 << "[tls]     -keyout server.key -out server.crt -subj \"/CN=localhost\"\n";
+        }
+    }
+
     // Launch connector threads for every other tracker entry so we form sync links.
     for (size_t i = 0; i < tracker_addrs.size(); ++i) {
         if ((int)i == my_index) continue;
@@ -1714,10 +1903,45 @@ int main(int argc, char **argv)
             continue;
         }
 
+        // Work out what kind of connection this is before reading any
+        // application data, because a TLS handshake has to happen first and
+        // the sync link is plaintext. A TLS ClientHello always starts with a
+        // 0x16 handshake record byte; "SYNC_INIT" starts with 'S'. MSG_PEEK
+        // inspects the byte without consuming it, so whichever path runs next
+        // still sees the full stream.
+        unsigned char firstbyte = 0;
+        ssize_t peeked;
+        do
+        {
+            peeked = recv(client_fd, &firstbyte, 1, MSG_PEEK);
+        } while (peeked < 0 && errno == EINTR);
+
+        if (peeked <= 0)
+        {
+            conn_close(client_fd);
+            continue;
+        }
+
+        if (firstbyte == 0x16)
+        {
+            if (!g_tls_ctx)
+            {
+                cerr << "[tls] client attempted TLS but no certificate is loaded; "
+                        "rejecting\n";
+                conn_close(client_fd);
+                continue;
+            }
+            if (!tls_accept(client_fd))
+            {
+                conn_close(client_fd);
+                continue;
+            }
+        }
+
         string firstline;
         if (!recv_line(client_fd, firstline))
         {
-            close(client_fd);
+            conn_close(client_fd);
             continue;
         }
         if (!firstline.empty() && firstline.back() == '\r')
@@ -1755,7 +1979,7 @@ int main(int argc, char **argv)
                     dispatch_command(client_fd, tokens);
                 }
                 cleanup_fd(client_fd);
-                close(client_fd);
+                conn_close(client_fd);
             };
             thread t(client_thread_func);
             t.detach();

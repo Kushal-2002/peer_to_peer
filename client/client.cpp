@@ -15,7 +15,9 @@
 #include <string>
 #include <vector>
 
+#include <openssl/err.h>
 #include <openssl/sha.h>
+#include <openssl/ssl.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -744,21 +746,143 @@ int start_peer_server(const string &bind_ip, unsigned short requested_port = 0)
 }
 
 //Socket IO helpers
+// ---------------- TLS for the tracker connection ----------------
+//
+// Only tracker connections are encrypted. `login` and `create_user` send a
+// plaintext password, and hashing on the tracker protects the stored credential
+// rather than the wire.
+//
+// Peer-to-peer connections stay plaintext on purpose: they carry file pieces and
+// no credentials, every piece is independently SHA-1 verified against the
+// manifest, and encrypting bulk transfer would add CPU cost to the download path
+// for no confidentiality gain here.
+//
+// TLS state is keyed by file descriptor so nothing above these helpers changes:
+// `send_line(fd, ...)` and `recv_line(fd, ...)` work for both kinds of
+// connection, and the peer code keeps using raw sockets without knowing TLS
+// exists.
+
+SSL_CTX *g_tls_ctx = nullptr;    // client-side context for tracker connections
+bool g_tls_verify_peer = false;  // true once a trust anchor has been loaded
+
+unordered_map<int, SSL *> ssl_by_fd;
+mutex ssl_by_fd_mtx;
+
+static SSL *ssl_for(int fd)
+{
+    lock_guard<mutex> lg(ssl_by_fd_mtx);
+    auto it = ssl_by_fd.find(fd);
+    return (it == ssl_by_fd.end()) ? nullptr : it->second;
+}
+
+static void ssl_attach(int fd, SSL *ssl)
+{
+    lock_guard<mutex> lg(ssl_by_fd_mtx);
+    ssl_by_fd[fd] = ssl;
+}
+
+// Closes a socket, tearing down TLS first if this fd has it. Safe on a
+// plaintext fd, which is why peer code can call it too.
+void conn_close(int fd)
+{
+    SSL *ssl = nullptr;
+    {
+        lock_guard<mutex> lg(ssl_by_fd_mtx);
+        auto it = ssl_by_fd.find(fd);
+        if (it != ssl_by_fd.end())
+        {
+            ssl = it->second;
+            ssl_by_fd.erase(it);
+        }
+    }
+    if (ssl)
+    {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+    }
+    if (fd >= 0)
+        close(fd);
+}
+
+static void tls_log_errors(const char *what)
+{
+    unsigned long e;
+    bool any = false;
+    while ((e = ERR_get_error()) != 0)
+    {
+        char buf[256];
+        ERR_error_string_n(e, buf, sizeof(buf));
+        cerr << "[tls] " << what << ": " << buf << "\n";
+        any = true;
+    }
+    if (!any)
+        cerr << "[tls] " << what << ": (no detail)\n";
+}
+
+// Builds the client context. When `ca_path` names a readable certificate it is
+// installed as the trust anchor and the tracker's certificate is verified
+// against it, which is what defeats an active man-in-the-middle. Without it the
+// connection is still encrypted, so passive sniffing is defeated, but the
+// tracker's identity is unverified - the difference is reported at startup
+// rather than hidden.
+static bool tls_client_init(const string &ca_path)
+{
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx)
+    {
+        tls_log_errors("SSL_CTX_new failed");
+        return false;
+    }
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+
+    if (!ca_path.empty() && SSL_CTX_load_verify_locations(ctx, ca_path.c_str(), nullptr) == 1)
+    {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+        g_tls_verify_peer = true;
+    }
+    else
+    {
+        if (!ca_path.empty())
+            ERR_clear_error(); // absent trust anchor is reported by the caller
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+        g_tls_verify_peer = false;
+    }
+    g_tls_ctx = ctx;
+    return true;
+}
+
 bool send_all(int fd, const string &s)
 {
+    SSL *ssl = ssl_for(fd);
     const char *p = s.data();
     size_t left = s.size();
     while (left > 0)
     {
-        ssize_t n = send(fd, p, left, 0);
-        if (n < 0)
+        ssize_t n;
+        if (ssl)
         {
-            if (errno == EINTR)
-                continue;
-            return false;
+            int w = SSL_write(ssl, p, (int)left);
+            if (w <= 0)
+            {
+                int err = SSL_get_error(ssl, w);
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+                    continue;
+                return false;
+            }
+            n = w;
         }
-        if (n == 0)
-            return false;
+        else
+        {
+            n = send(fd, p, left, 0);
+            if (n < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                return false;
+            }
+            if (n == 0)
+                return false;
+        }
         p += n;
         left -= n;
     }
@@ -777,19 +901,36 @@ bool send_line(int fd, const string &line)
 // read a line (no newline char) from a socket, blocking
 bool recv_line(int fd, string &out)
 {
+    SSL *ssl = ssl_for(fd);
     out.clear();
     char c;
     while (true)
     {
-        ssize_t r = recv(fd, &c, 1, 0);
-        if (r < 0)
+        ssize_t r;
+        if (ssl)
         {
-            if (errno == EINTR)
-                continue;
-            return false;
+            int rd = SSL_read(ssl, &c, 1);
+            if (rd <= 0)
+            {
+                int err = SSL_get_error(ssl, rd);
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+                    continue;
+                return false; // closed or fatal
+            }
+            r = rd;
         }
-        if (r == 0)
-            return false; // closed
+        else
+        {
+            r = recv(fd, &c, 1, 0);
+            if (r < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                return false;
+            }
+            if (r == 0)
+                return false; // closed
+        }
         if (c == '\n')
             break;
         if (c == '\r')
@@ -1466,6 +1607,54 @@ int connect_to_addr(const string &addr)
     return s;
 }
 
+// Connects to a tracker and raises TLS over the socket, so credentials are
+// encrypted before the first `login` is sent. Returns -1 if either the TCP
+// connect or the handshake fails. Peer connections use connect_to_addr()
+// directly and stay plaintext.
+static int connect_tracker(const string &addr)
+{
+    int fd = connect_to_addr(addr);
+    if (fd < 0)
+        return -1;
+    if (!g_tls_ctx)
+    {
+        // No TLS context at all: refuse rather than silently sending the
+        // password in the clear.
+        cerr << "[tls] no TLS context; refusing to send credentials in the clear\n";
+        close(fd);
+        return -1;
+    }
+    SSL *ssl = SSL_new(g_tls_ctx);
+    if (!ssl)
+    {
+        tls_log_errors("SSL_new failed");
+        close(fd);
+        return -1;
+    }
+    SSL_set_fd(ssl, fd);
+    // Lets the tracker select a certificate by name, and is what hostname
+    // verification checks against when a trust anchor is configured.
+    {
+        size_t colon = addr.find(':');
+        string host = (colon == string::npos) ? addr : addr.substr(0, colon);
+        if (!host.empty())
+        {
+            SSL_set_tlsext_host_name(ssl, host.c_str());
+            if (g_tls_verify_peer)
+                SSL_set1_host(ssl, host.c_str());
+        }
+    }
+    if (SSL_connect(ssl) != 1)
+    {
+        tls_log_errors(("handshake with " + addr + " failed").c_str());
+        SSL_free(ssl);
+        close(fd);
+        return -1;
+    }
+    ssl_attach(fd, ssl);
+    return fd;
+}
+
 int connect_any_tracker(const vector<string> &trackers, int start_idx, int &out_idx)
 {
     if (trackers.empty())
@@ -1477,7 +1666,7 @@ int connect_any_tracker(const vector<string> &trackers, int start_idx, int &out_
     for (int i = 0; i < n; ++i)
     {
         int idx = (start_idx + i) % n;
-        int s = connect_to_addr(trackers[idx]);
+        int s = connect_tracker(trackers[idx]);
         if (s >= 0)
         {
             out_idx = idx;
@@ -1512,7 +1701,7 @@ static bool tracker_announce(const vector<string> &trackers, int start_idx,
     if (user.empty() || pass.empty())
     {
         log_to_file_sync("[announce] no stored credentials, cannot authenticate");
-        close(tsock);
+        conn_close(tsock);
         return false;
     }
 
@@ -1521,13 +1710,13 @@ static bool tracker_announce(const vector<string> &trackers, int start_idx,
         lrep.rfind("OK", 0) != 0)
     {
         log_to_file_sync("[announce] re-login failed: " + lrep);
-        close(tsock);
+        conn_close(tsock);
         return false;
     }
 
     string rep;
     bool ok = send_line(tsock, command) && recv_line(tsock, rep);
-    close(tsock);
+    conn_close(tsock);
     if (!ok)
     {
         log_to_file_sync("[announce] send/recv failed for: " + command);
@@ -1641,6 +1830,28 @@ int main(int argc, char **argv)
         my_peer_addr = string("127.0.0.1:") + to_string(my_peer_port);
     }
     cerr << "[peer] advertising peer address: " << my_peer_addr << "\n";
+
+    // Bring up TLS before the first tracker connection, since the very first
+    // thing sent over it is usually a `login` carrying a plaintext password.
+    {
+        const char *ca_env = getenv("TRACKER_TLS_CA");
+        string ca_path = ca_env ? ca_env : "server.crt";
+
+        if (!tls_client_init(ca_path))
+        {
+            cerr << "Failed to initialise TLS; refusing to continue, because "
+                    "credentials would otherwise be sent in the clear.\n";
+            return 1;
+        }
+        if (g_tls_verify_peer)
+            cerr << "[tls] enabled, verifying tracker against " << ca_path << "\n";
+        else
+            cerr << "[tls] enabled WITHOUT certificate verification (" << ca_path
+                 << " not found). Traffic is encrypted, so passwords are safe from\n"
+                 << "[tls] passive sniffing, but the tracker's identity is unverified -\n"
+                 << "[tls] an active man-in-the-middle would not be detected. Copy the\n"
+                 << "[tls] tracker's server.crt here, or set TRACKER_TLS_CA, to fix this.\n";
+    }
 
     vector<string> trackers = load_trackers(trackers_file);
     if (trackers.empty())
@@ -1815,13 +2026,13 @@ int main(int argc, char **argv)
 
             string cmd = "stop_share " + gid + " " + fname;
             if (!send_line(sock, cmd)) {
-                close(sock); sock = -1;
+                conn_close(sock); sock = -1;
                 cout << "ERR tracker_send_failed\n";
                 continue;
             }
             string trep;
             if (!recv_line(sock, trep)) {
-                close(sock); sock = -1;
+                conn_close(sock); sock = -1;
                 cout << "ERR tracker_no_reply\n";
                 continue;
             }
@@ -1907,7 +2118,7 @@ int main(int argc, char **argv)
             if (!send_line(sock, getm))
             {
                 cerr << "tracker send failed\n";
-                close(sock);
+                conn_close(sock);
                 sock = -1;
                 break;
             }
@@ -1915,7 +2126,7 @@ int main(int argc, char **argv)
             if (!recv_line(sock, trep))
             {
                 cerr << "tracker closed\n";
-                close(sock);
+                conn_close(sock);
                 sock = -1;
                 break;
             }
@@ -2114,7 +2325,7 @@ int main(int argc, char **argv)
                             } else {
                                 log_to_file_sync("[auto-upload] failed to send upload manifest to tracker\n");
                             }
-                            close(tsock);
+                            conn_close(tsock);
                         } else {
                             log_to_file_sync("[auto-upload] could not connect to any tracker to announce upload\n");
                             
@@ -2187,7 +2398,7 @@ int main(int argc, char **argv)
             // send the user's command (possibly modified)
             if (!send_line(sock, line))
             {
-                close(sock);
+                conn_close(sock);
                 sock = -1;
                 cerr << "Send failed, trying next tracker...\n";
                 continue;
@@ -2197,7 +2408,7 @@ int main(int argc, char **argv)
             string resp;
             if (!recv_line(sock, resp))
             {
-                close(sock);
+                conn_close(sock);
                 sock = -1;
                 cerr << "Receive failed, connection closed by tracker. Trying next tracker...\n";
                 continue;
@@ -2265,7 +2476,7 @@ int main(int argc, char **argv)
     } // end while
 
     if (sock >= 0)
-        close(sock);
+        conn_close(sock);
     cout << "Client exiting\n";
     {
         lock_guard<mutex> lg(downloads_mtx);

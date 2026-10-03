@@ -3,8 +3,8 @@
 A BitTorrent-style file sharing system written from scratch in C++17 on raw POSIX
 sockets. Files are split into pieces, verified individually with SHA-1, and
 downloaded in parallel from multiple peers at once. A replicated metadata tracker
-handles authentication, group membership and peer discovery — but never carries
-file data.
+handles authentication, group membership and peer discovery over TLS — but never
+carries file data.
 
 No external frameworks. ~4,000 lines of C++ across two binaries, plus a Python
 benchmark harness that drives the real processes.
@@ -17,7 +17,7 @@ The system separates **metadata** from **bulk data**, and the two travel over
 completely different paths:
 
 ```
-         CONTROL PLANE — metadata only, no file bytes
+      CONTROL PLANE — metadata only, no file bytes (TLS 1.2+)
   ┌──────────────┐   SYNC_* records   ┌──────────────┐
   │  tracker[0]  │◄──────────────────►│  tracker[1]  │
   │  :9000       │   (journaled,      │  :9001       │
@@ -29,7 +29,7 @@ completely different paths:
   └────────────────┘              └──────────────────┘
          ▲                  ▲                  ▲
          │ upload_file      │ get_manifest     │ list_files
-         │                  │ download_file    │
+         │ (over TLS)       │ download_file    │ (over TLS)
   ───────┼──────────────────┼──────────────────┼────────────
          │   DATA PLANE — 512 KiB pieces, peer ⇄ peer
   ┌──────┴─────┐     ┌──────┴─────┐     ┌──────┴─────┐
@@ -105,13 +105,39 @@ file; a mismatch requeues it, up to five attempts, typically landing on a
 different peer. The full-file hash is checked before the `.part` is renamed into
 place.
 
-### Password storage
+### Credentials: at rest and in transit
 
-Passwords are hashed with PBKDF2-HMAC-SHA256, 100,000 iterations, with a random
-16-byte salt per user. Hashing happens at the edge where the plaintext arrives, so
-the plaintext never reaches stored state, the journal, or the replication link.
-The key derivation runs outside the mutex so concurrent logins are not serialised
-behind one deliberately slow operation.
+These are two separate problems, and both are addressed.
+
+**At rest**, passwords are hashed with PBKDF2-HMAC-SHA256, 100,000 iterations,
+with a random 16-byte salt per user. Hashing happens at the edge where the
+plaintext arrives, so the plaintext never reaches stored state, the journal, or
+the replication link. The key derivation runs outside the mutex so concurrent
+logins are not serialised behind one deliberately slow operation.
+
+**In transit**, client-to-tracker connections run over TLS 1.2+. Hashing protects
+a stolen credential database; it does nothing for an attacker watching the
+network, who would otherwise read `login alice secret123` straight off the wire.
+
+The tracker serves one port for both clients and sync peers, which creates an
+ordering problem: a TLS handshake has to complete before any application data is
+read, but the tracker identifies a sync peer *by* reading its first line
+(`SYNC_INIT`). It is resolved by inspecting the first byte with `MSG_PEEK`, which
+does not consume it — a TLS handshake always begins with a `0x16` record byte,
+while `SYNC_INIT` begins with `S`. The connection is routed accordingly and
+either path then sees the full stream.
+
+TLS state is keyed by file descriptor, so `send_line(fd, ...)` and
+`recv_line(fd, ...)` transparently use `SSL_write`/`SSL_read` when a descriptor
+has TLS attached and `send`/`recv` otherwise. Because all socket I/O in both
+programs already funnelled through those two helpers, no call site above them
+changed.
+
+Peer-to-peer connections stay plaintext deliberately: they carry file pieces and
+no credentials, every piece is independently SHA-1 verified against the manifest,
+and encrypting bulk transfer would add CPU cost to the download path for no
+confidentiality gain. The tracker-to-tracker sync link is also still plaintext —
+see [Known limitations](#known-limitations).
 
 ---
 
@@ -143,6 +169,37 @@ cd ../client && g++ -std=gnu++17 -O2 -Wall -Wextra client.cpp -o client \
 ---
 
 ## Running
+
+### Generate a TLS certificate
+
+The tracker needs a certificate and key before it will accept encrypted client
+connections. A self-signed pair is fine for local use:
+
+```bash
+cd tracker
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout server.key -out server.crt \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+chmod 600 server.key
+cp server.crt ../client/server.crt     # the client's trust anchor
+```
+
+The `subjectAltName` matters: without it the client cannot verify the hostname
+and falls back to encryption without authentication.
+
+Neither file is committed — the key is secret, and the certificate is per
+deployment. Override the paths with `TRACKER_TLS_CERT` / `TRACKER_TLS_KEY` on the
+tracker and `TRACKER_TLS_CA` on the client.
+
+Behaviour when files are missing is deliberately asymmetric. The tracker falls
+back to plaintext with a loud warning, so an existing deployment is not broken by
+upgrading. The client **refuses to run** without a TLS context, because the
+alternative is silently transmitting a password in the clear. If the client has a
+TLS context but no trust anchor, it connects encrypted-but-unverified and says
+so: passive sniffing is defeated, an active man-in-the-middle is not.
+
+### Tracker configuration
 
 `tracker_info.txt` holds one `host:port` per line, one per tracker instance:
 
@@ -284,27 +341,38 @@ scaling (fixed seeders, concurrent downloaders), and a centralized single-source
 TCP baseline written inside the harness for comparison. Results print and are
 written to `results.csv`.
 
-### Measured — 2 MB file, loopback, single machine
+### Measured — 16 MB file, 3 trials averaged, loopback, single machine
 
-| Configuration | Time | Throughput |
-|---|---|---|
-| P2P, 1 seeder | 0.038 s | 52.98 MB/s |
-| P2P, 2 seeders | 0.025 s | **79.53 MB/s** |
-| Centralized, 1 source | 0.001 s | ~1,700 MB/s |
+Peer scaling, one downloader:
 
-**Adding a second seeder made the download 1.5× faster** — the multi-peer path
-doing exactly what it is designed to do.
+| Seeders | Time | Throughput | vs. 1 seeder |
+|---|---|---|---|
+| 1 | 0.073 s | 219.60 MB/s | — |
+| 2 | 0.050 s | 319.57 MB/s | **1.46×** |
+| 4 | 0.050 s | 321.17 MB/s | 1.46× (no further gain) |
 
-In absolute terms the naive centralized baseline still wins at this file size, for
-three reasons worth being explicit about: a 2 MB file is only four 512 KiB pieces,
-so there is very little to parallelise; every peer here is a process on one
-machine reading from one disk, so seeders compete for a single device instead of
-contributing independent bandwidth; and the centralized baseline does a single
-sequential read with no chunking and no hashing, so it pays none of the integrity
-cost the P2P path pays per piece.
+**Adding a second seeder makes the download 1.46× faster**, which is the multi-peer
+path doing what it is designed to do. Going from two to four adds nothing — on a
+single machine every seeder reads the same file from the same disk, so the
+bottleneck moves from peer availability to that one device. On separate hosts with
+independent disks the curve would be expected to keep rising.
+
+A note on methodology: these are averages over three trials. At smaller sizes
+(~2 MB, four pieces, sub-30 ms transfers) run-to-run variance exceeds the effect
+being measured, and single trials there can show two seeders as *slower* than one.
+Any claim about scaling needs both a large enough file and repeated trials.
+
+For comparison, the centralized baseline reached ~2,410 MB/s with one downloader
+and ~1,284 MB/s with four. **It still wins in absolute terms at 16 MB, by roughly
+7×**, for three reasons worth being explicit about: all peers share one disk and
+one set of cores, so the swarm cannot contribute independent bandwidth; the
+baseline does a single sequential read with no chunking and no hashing, so it pays
+none of the per-piece integrity cost; and there is no network latency on loopback,
+which is precisely the cost that multi-peer parallelism exists to hide.
 
 **The file size at which P2P overtakes the centralized baseline has not been
-measured.** Finding it requires a much larger file and ideally separate hosts.
+measured** — it was not reached at 16 MB. Finding it requires a much larger file
+and, more importantly, separate hosts.
 
 ---
 
@@ -341,11 +409,20 @@ Honest about what this does and does not do:
   tracker holding a different password hash permanently, because deduplication
   matches whole records and conflicting records are not identical. Resolving this
   properly needs a total ordering of writes or an explicit merge rule.
-- **No transport encryption.** Passwords are hashed at rest and in the journal,
-  but travel to the tracker in cleartext. TLS is the fix.
-- **The peer protocol is unauthenticated.** Group membership is enforced by the
-  tracker but not peer-to-peer, so any host that can reach a peer's port and
-  knows an owner and filename can request pieces.
+- **The tracker-to-tracker sync link is still plaintext.** It carries PBKDF2
+  credentials rather than plaintext passwords, so the exposure is smaller, but it
+  is exposure. It was left unencrypted because a sync connection has one thread
+  writing broadcasts while another reads inbound records, and sharing one SSL
+  object between a concurrent reader and writer is not safe. Fixing it properly
+  means serialising access per connection or giving each direction its own
+  connection — not a large change, but a real one.
+- **The peer protocol is unauthenticated and unencrypted.** Group membership is
+  enforced by the tracker but not peer-to-peer, so any host that can reach a
+  peer's port and knows an owner and filename can request pieces. Piece contents
+  are integrity-checked but not confidential.
+- **Self-signed certificates only.** There is no CA infrastructure, so the
+  client's trust anchor is the tracker's own certificate, distributed by hand.
+  Fine for a known deployment; it does not scale to arbitrary peers.
 - **SHA-1 for piece integrity.** Sufficient against accidental corruption, not
   against a deliberate collision. SHA-256 would be a small change.
 - **No choking / tit-for-tat.** Real BitTorrent rations upload bandwidth toward
