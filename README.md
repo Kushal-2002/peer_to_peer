@@ -6,7 +6,7 @@ downloaded in parallel from multiple peers at once. A replicated metadata tracke
 handles authentication, group membership and peer discovery over TLS — but never
 carries file data.
 
-No external frameworks. ~4,000 lines of C++ across two binaries, plus a Python
+No external frameworks. ~4,500 lines of C++ across two binaries, plus a Python
 benchmark harness that drives the real processes.
 
 ---
@@ -347,11 +347,11 @@ Peer scaling, one downloader:
 
 | Seeders | Time | Throughput | vs. 1 seeder |
 |---|---|---|---|
-| 1 | 0.073 s | 219.60 MB/s | — |
-| 2 | 0.050 s | 319.57 MB/s | **1.46×** |
-| 4 | 0.050 s | 321.17 MB/s | 1.46× (no further gain) |
+| 1 | 0.073 s | 219.76 MB/s | — |
+| 2 | 0.050 s | 319.58 MB/s | **1.45×** |
+| 4 | 0.050 s | 321.21 MB/s | 1.46× (no further gain) |
 
-**Adding a second seeder makes the download 1.46× faster**, which is the multi-peer
+**Adding a second seeder makes the download about 1.45× faster**, which is the multi-peer
 path doing what it is designed to do. Going from two to four adds nothing — on a
 single machine every seeder reads the same file from the same disk, so the
 bottleneck moves from peer availability to that one device. On separate hosts with
