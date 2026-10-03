@@ -25,9 +25,9 @@
 #include <string>
 #include <mutex>
 
-#include <atomic>             // std::atomic
-#include <condition_variable> // condition_variable
-#include <limits>             // numeric limits if you prefer
+#include <atomic>             
+#include <condition_variable> 
+#include <limits>            
 #include <algorithm>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -36,7 +36,7 @@
 #include <mutex>
 
 using namespace std;
-// --- forward declarations (prototypes) used by functions that appear earlier in the file ---
+//  forward declarations (prototypes) used by functions that appear earlier in the file
 int connect_to_addr(const string &addr);
 int connect_any_tracker(const vector<string> &trackers, int start_idx, int &out_idx);
 
@@ -47,6 +47,11 @@ bool recv_line(int fd, string &out);
 // read up to len bytes from filepath at offset; used by peer handler
 ssize_t read_file_piece(const string &filepath, off_t offset, void *buf, size_t len);
 
+// Wire-protocol constant: the unit that every piece request, piece hash and
+// file offset is computed in. Both ends of the peer protocol must agree on
+// it, so it is defined once here rather than redeclared per function.
+static const size_t PIECE_SIZE = 512 * 1024;
+
 // current logged-in user for this client process (set on login)
 string current_user;
 string current_pass;
@@ -55,6 +60,26 @@ mutex current_user_mtx;
 
 unordered_map<string, string> shared_files; // filename -> full path
 mutex shared_files_mtx;
+
+// A file this client is still downloading but can already serve pieces from.
+//
+// Without this, a peer only ever advertises files it holds in full, so every
+// peer in a swarm reports "I have everything", piece availability is uniform,
+// and rarest-first ordering has nothing to order. Registering a download as a
+// partial share the moment it starts is what makes some pieces genuinely
+// scarcer than others.
+struct PartialShare
+{
+    string partpath;   // the .part file that verified pieces are written into
+    uint64_t filesize = 0;
+    size_t num_pieces = 0;
+    vector<char> have; // 1 = piece is complete and verified, safe to serve
+    mutex mtx;         // guards have[]; a piece never goes from 1 back to 0
+};
+
+// Keyed the same way as shared_files: bare basename, and "owner:basename".
+unordered_map<string, shared_ptr<PartialShare>> partial_shares;
+mutex partial_shares_mtx;
 
 enum class DLStatus
 {
@@ -84,10 +109,11 @@ struct DownloadJob
 mutex downloads_mtx;
 unordered_map<string, shared_ptr<DownloadJob>> downloads; // id -> job
 
-// remember files we announced to tracker: filename -> group id
-// this lets us call stop_share on exit or later.
+//for stop_share 
 unordered_map<string,string> local_uploaded_gid; // basename -> gid
 mutex local_uploaded_mtx;
+
+void log_to_file_sync(const std::string &msg);
 
 // Remove basename and owner:basename mapping (if present)
 void unregister_shared_file(const string &basename, const string &owner = "") {
@@ -171,7 +197,9 @@ void log_to_file_sync(const std::string &msg)
 }
 
 // Register basename -> fullpath mapping in a thread-safe way.
-// Call this from main after computing fname and filepath while handling upload_file.
+
+
+
 void register_shared_file(const std::string &basename, const std::string &fullpath)
 {
     lock_guard<mutex> lg(shared_files_mtx);
@@ -202,6 +230,58 @@ void register_shared_file_both(const std::string &basename,
     log_to_file_sync("\n");
 }
 
+// ---------------- partial share registry ----------------
+
+// Publish an in-progress download so the peer server can serve the pieces of it
+// that are already verified. Registered under both key forms so a requester can
+// address us either way.
+shared_ptr<PartialShare> register_partial_share(const string &basename,
+                                                const string &owner,
+                                                const string &partpath,
+                                                uint64_t filesize,
+                                                size_t num_pieces)
+{
+    auto ps = make_shared<PartialShare>();
+    ps->partpath = partpath;
+    ps->filesize = filesize;
+    ps->num_pieces = num_pieces;
+    ps->have.assign(num_pieces, 0);
+
+    lock_guard<mutex> lg(partial_shares_mtx);
+    partial_shares[basename] = ps;
+    if (!owner.empty())
+        partial_shares[owner + ":" + basename] = ps;
+    log_to_file_sync("[partial] registered '" + basename + "' -> '" + partpath +
+                     "' (" + to_string(num_pieces) + " pieces)");
+    return ps;
+}
+
+void unregister_partial_share(const string &basename, const string &owner = "")
+{
+    lock_guard<mutex> lg(partial_shares_mtx);
+    partial_shares.erase(basename);
+    if (!owner.empty())
+        partial_shares.erase(owner + ":" + basename);
+    log_to_file_sync("[partial] unregistered '" + basename + "'");
+}
+
+// Resolve using the owner-scoped key first, then the bare basename, mirroring
+// how shared_files is looked up.
+shared_ptr<PartialShare> lookup_partial_share(const string &owner, const string &filename)
+{
+    lock_guard<mutex> lg(partial_shares_mtx);
+    if (!owner.empty() && owner != "-")
+    {
+        auto it = partial_shares.find(owner + ":" + filename);
+        if (it != partial_shares.end())
+            return it->second;
+    }
+    auto it2 = partial_shares.find(filename);
+    if (it2 != partial_shares.end())
+        return it2->second;
+    return nullptr;
+}
+
 // Convert SHA1 digest to hex
 static string sha1_to_hex(const unsigned char *d)
 {
@@ -218,7 +298,6 @@ bool compute_piece_and_file_sha1(const string &path,
                                  string &out_fullsha1,
                                  vector<string> &out_piece_sha1s)
 {
-    const size_t PIECE_SIZE = 512 * 1024;
     out_piece_sha1s.clear();
     out_fullsha1.clear();
     out_filesize = 0;
@@ -331,171 +410,6 @@ static string sha1_of_buf_hex(const void *buf, size_t len)
     return oss.str();
 }
 
-// Owner-aware sequential downloader (fallback).
-// peer_addr: "ip:port"
-// owner: owner string (pass "-" or empty for legacy)
-// filename: basename
-bool download_from_peer_sequential(const string &peer_addr,
-                                   const string &owner,
-                                   const string &filename,
-                                   const string &destpath,
-                                   uint64_t filesize,
-                                   const vector<string> &piece_hashes,
-                                   const string &expected_fullsha1 = "")
-{
-    int s = connect_to_addr(peer_addr);
-    if (s < 0)
-    {
-        cerr << "[dl] connect to " << peer_addr << " failed\n";
-        return false;
-    }
-
-    int outfd = open(destpath.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    if (outfd < 0)
-    {
-        cerr << "[dl] open dest failed: " << strerror(errno) << "\n";
-        close(s);
-        return false;
-    }
-
-    const size_t PIECE_SIZE = 512 * 1024;
-    size_t num_pieces = piece_hashes.size();
-    vector<char> buf(PIECE_SIZE);
-
-    for (size_t idx = 0; idx < num_pieces; ++idx)
-    {
-        ostringstream req;
-        if (!owner.empty() && owner != "-")
-            req << "REQUEST_PIECE " << owner << " " << filename << " " << idx;
-        else
-            req << "REQUEST_PIECE " << filename << " " << idx;
-
-        if (!send_line(s, req.str()))
-        {
-            cerr << "[dl] send failed\n";
-            close(outfd);
-            close(s);
-            return false;
-        }
-
-        string hdr;
-        if (!recv_line(s, hdr))
-        {
-            cerr << "[dl] recv header failed\n";
-            close(outfd);
-            close(s);
-            return false;
-        }
-        istringstream ih(hdr);
-        string kw;
-        size_t ridx;
-        ssize_t rlen;
-        ih >> kw >> ridx >> rlen;
-        if (kw != "PIECE" || ridx != idx || rlen <= 0)
-        {
-            cerr << "[dl] bad piece header: " << hdr << "\n";
-            close(outfd);
-            close(s);
-            return false;
-        }
-
-        size_t remaining = (size_t)rlen;
-        if (buf.size() < remaining)
-            buf.resize(remaining);
-
-        char *p = buf.data();
-        while (remaining > 0)
-        {
-            ssize_t r = recv(s, p, remaining, 0);
-            if (r < 0)
-            {
-                if (errno == EINTR)
-                    continue;
-                cerr << "[dl] recv error\n";
-                close(outfd);
-                close(s);
-                return false;
-            }
-            if (r == 0)
-            {
-                cerr << "[dl] peer closed unexpectedly\n";
-                close(outfd);
-                close(s);
-                return false;
-            }
-            p += r;
-            remaining -= (size_t)r;
-        }
-
-        string got_hex = sha1_of_buf_hex(buf.data(), (size_t)rlen);
-        if (got_hex != piece_hashes[idx])
-        {
-            cerr << "[dl] piece " << idx << " hash mismatch\n";
-            close(outfd);
-            close(s);
-            return false;
-        }
-
-        off_t offset = (off_t)idx * (off_t)PIECE_SIZE;
-        ssize_t wn = pwrite(outfd, buf.data(), (size_t)rlen, offset);
-        if (wn < 0 || wn != rlen)
-        {
-            cerr << "[dl] write failed: " << strerror(errno) << "\n";
-            close(outfd);
-            close(s);
-            return false;
-        }
-    }
-
-    if (!expected_fullsha1.empty())
-    {
-        close(outfd);
-        int rfd = open(destpath.c_str(), O_RDONLY);
-        if (rfd >= 0)
-        {
-            SHA_CTX fullctx;
-            SHA1_Init(&fullctx);
-            vector<char> tmp(4096);
-            while (true)
-            {
-                ssize_t rr = read(rfd, tmp.data(), (ssize_t)tmp.size());
-                if (rr < 0)
-                {
-                    if (errno == EINTR)
-                        continue;
-                    break;
-                }
-                if (rr == 0)
-                    break;
-                SHA1_Update(&fullctx, tmp.data(), (size_t)rr);
-            }
-            unsigned char full_digest[SHA_DIGEST_LENGTH];
-            SHA1_Final(full_digest, &fullctx);
-            string got_full = sha1_to_hex(full_digest);
-            close(rfd);
-            if (got_full != expected_fullsha1)
-            {
-                cerr << "[dl] full-file SHA1 mismatch\n";
-                close(s);
-                return false;
-            }
-        }
-        else
-        {
-            cerr << "[dl] cannot open for fullsha: " << strerror(errno) << "\n";
-            close(s);
-            return false;
-        }
-    }
-    else
-    {
-        close(outfd);
-    }
-
-    close(s);
-    return true;
-}
-
 // read up to len bytes from filepath at offset; returns bytes read or -1 on error
 ssize_t read_file_piece(const string &filepath, off_t offset, void *buf, size_t len)
 {
@@ -521,8 +435,7 @@ ssize_t read_file_piece(const string &filepath, off_t offset, void *buf, size_t 
     return total;
 }
 
-// Replace existing peer_connection_handler with this full function.
-// Supports:
+
 //   QUERY_HAVE <owner> <filename>   (or QUERY_HAVE <filename> legacy)
 //   REQUEST_PIECE <owner> <filename> <idx>
 //   REQUEST_PIECE <filename> <idx>   (legacy)
@@ -555,15 +468,35 @@ void peer_connection_handler(int cfd)
             string owner, filename;
             if (iss >> token2)
             {
-                // two-token form: owner filename
                 owner = token1;
                 filename = token2;
             }
             else
             {
-                // single-token legacy: filename only
                 owner = "-";
                 filename = token1;
+            }
+
+            // An in-progress download takes priority: we hold only part of it,
+            // so answer with the exact set of pieces rather than claiming all.
+            if (auto ps = lookup_partial_share(owner, filename))
+            {
+                ostringstream resp;
+                resp << "OK HAVE";
+                size_t held = 0;
+                {
+                    lock_guard<mutex> lg(ps->mtx);
+                    for (size_t i = 0; i < ps->have.size(); ++i)
+                        if (ps->have[i])
+                        {
+                            resp << " " << i;
+                            ++held;
+                        }
+                }
+                // "NONE" is explicit because a bare "OK HAVE" is ambiguous and
+                // the requester would have to guess what an empty list means.
+                send_line(cfd, held ? resp.str() : string("OK HAVE NONE"));
+                continue;
             }
 
             // resolve real path using owner:filename; fallback to filename
@@ -597,11 +530,8 @@ void peer_connection_handler(int cfd)
                 continue;
             }
             off_t filesize = st.st_size;
-            const size_t PIECE_SIZE = 512 * 1024;
             size_t num_pieces = (filesize + PIECE_SIZE - 1) / PIECE_SIZE;
 
-            // For now we reply "OK HAVE ALL" because if file exists locally we expose all pieces.
-            // You could enhance this to list per-piece availability if supporting partial files.
             ostringstream resp;
             resp << "OK HAVE ALL " << num_pieces;
             send_line(cfd, resp.str());
@@ -610,7 +540,6 @@ void peer_connection_handler(int cfd)
 
         if (cmd == "REQUEST_PIECE")
         {
-            // Try new format: REQUEST_PIECE <owner> <filename> <idx>
             string owner, filename;
             long long idxll;
             bool parsed_new = false;
@@ -621,7 +550,6 @@ void peer_connection_handler(int cfd)
             }
             else
             {
-                // reset and try legacy: REQUEST_PIECE <filename> <idx>
                 iss.clear();
                 iss.seekg(sp);
                 if (!(iss >> filename >> idxll))
@@ -637,6 +565,46 @@ void peer_connection_handler(int cfd)
                 continue;
             }
             size_t piece_idx = (size_t)idxll;
+
+            // Serve out of an in-progress download's .part file, but only for
+            // pieces that already passed verification. Anything else is refused
+            // so the requester retries elsewhere instead of receiving a hole.
+            if (auto ps = lookup_partial_share(owner, filename))
+            {
+                bool holds = false;
+                string ppath;
+                uint64_t psize = 0;
+                {
+                    // partpath is re-pointed at the final file once the download
+                    // completes, so read it under the same lock as have[].
+                    lock_guard<mutex> lg(ps->mtx);
+                    holds = piece_idx < ps->have.size() && ps->have[piece_idx];
+                    ppath = ps->partpath;
+                    psize = ps->filesize;
+                }
+                if (!holds)
+                {
+                    send_line(cfd, "ERR no_such_piece");
+                    continue;
+                }
+                off_t off = (off_t)piece_idx * (off_t)PIECE_SIZE;
+                size_t want = (size_t)min<off_t>((off_t)PIECE_SIZE,
+                                                 (off_t)psize - off);
+                vector<char> pbuf(want);
+                ssize_t pgot = read_file_piece(ppath, off, pbuf.data(), want);
+                if (pgot <= 0)
+                {
+                    send_line(cfd, "ERR read_failed");
+                    continue;
+                }
+                ostringstream phdr;
+                phdr << "PIECE " << piece_idx << " " << pgot;
+                if (!send_line(cfd, phdr.str()))
+                    break;
+                if (!send_all(cfd, string(pbuf.data(), (size_t)pgot)))
+                    break;
+                continue;
+            }
 
             // Resolve real path using owner:filename key
             string realpath;
@@ -672,14 +640,14 @@ void peer_connection_handler(int cfd)
                 continue;
             }
             off_t filesize = st.st_size;
-            off_t offset = (off_t)piece_idx * (off_t)(512 * 1024);
+            off_t offset = (off_t)piece_idx * (off_t)PIECE_SIZE;
             if (offset >= filesize)
             {
                 send_line(cfd, "ERR no_such_piece");
                 continue;
             }
 
-            size_t to_read = (size_t)min<off_t>((off_t)512 * 1024, filesize - offset);
+            size_t to_read = (size_t)min<off_t>((off_t)PIECE_SIZE, filesize - offset);
             vector<char> buf(to_read);
             ssize_t got = read_file_piece(realpath, offset, buf.data(), to_read);
             if (got <= 0)
@@ -703,7 +671,6 @@ void peer_connection_handler(int cfd)
     close(cfd);
 }
 
-// Replace your existing start_peer_server(...) with this function
 int start_peer_server(const string &bind_ip, unsigned short requested_port = 0)
 {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -733,7 +700,7 @@ int start_peer_server(const string &bind_ip, unsigned short requested_port = 0)
     }
 
     addr.sin_port = htons(requested_port);
-    if (bind(listen_fd, (sockaddr *)&addr, sizeof(addr)) < 0)
+    if (::bind(listen_fd, (sockaddr *)&addr, sizeof(addr)) < 0)
     {
         perror("peer bind");
         close(listen_fd);
@@ -776,7 +743,7 @@ int start_peer_server(const string &bind_ip, unsigned short requested_port = 0)
     return (int)requested_port;
 }
 
-// ---------------- helpers for socket I/O ----------------
+//Socket IO helpers
 bool send_all(int fd, const string &s)
 {
     const char *p = s.data();
@@ -832,7 +799,7 @@ bool recv_line(int fd, string &out)
     return true;
 }
 
-// ---------------- tracker list loader ----------------
+
 vector<string> load_trackers(const string &path)
 {
     vector<string> v;
@@ -897,12 +864,6 @@ vector<string> load_trackers(const string &path)
     return v;
 }
 
-// Multi-peer downloader (robust). Call this from main instead of the old sequential call.
-// peer_entries: vector of strings "owner@ip:port" or "-" entries
-// filename: basename
-// destpath: final destination path (we write to destpath + ".part" then rename on success)
-// piece_hashes: vector of per-piece SHA1 hex strings
-// expected_fullsha1: optional
 bool download_manager_multipeer(const vector<string> &peer_entries,
                                 const string &filename,
                                 const string &destpath,
@@ -911,7 +872,6 @@ bool download_manager_multipeer(const vector<string> &peer_entries,
                                 const string &expected_fullsha1 = "",
                                 shared_ptr<DownloadJob> job = nullptr)
 {
-    const size_t PIECE_SIZE = 512 * 1024;
     size_t num_pieces = piece_hashes.size();
     if (num_pieces == 0)
         return false;
@@ -993,21 +953,29 @@ bool download_manager_multipeer(const vector<string> &peer_entries,
             continue;
         }
 
-        // parse remainder:
-        // reply forms:
-        //  "OK HAVE ALL <num_pieces>"
-        //  "OK HAVE <i1> <i2> <i3> ..."
-        // We'll detect "ALL" token or treat tokens as indices.
+
+        // Reply is one of: "ALL <n>" (complete file), "NONE" (nothing yet), or
+        // a list of the piece indices the peer currently holds.
         string tok;
         if (!(ir >> tok))
         {
-            // no more tokens -> assume ALL
-            p->alive = true;
+            // A bare "OK HAVE" tells us nothing. Treating it as ALL would make
+            // us request pieces the peer does not have, so drop the peer.
+            p->have.assign(num_pieces, 0);
+            p->alive = false;
             continue;
         }
         if (tok == "ALL")
         {
             // leave as all ones
+            p->alive = true;
+            continue;
+        }
+        else if (tok == "NONE")
+        {
+            // Peer is registered for this file but has no verified piece yet.
+            // Keep it alive: it is downloading too and will have pieces soon.
+            p->have.assign(num_pieces, 0);
             p->alive = true;
             continue;
         }
@@ -1023,7 +991,7 @@ bool download_manager_multipeer(const vector<string> &peer_entries,
                     p->have[idx0] = 1;
             }
             catch (...)
-            { /* ignore */
+            {
             }
             int idx;
             while (ir >> idx)
@@ -1054,6 +1022,26 @@ bool download_manager_multipeer(const vector<string> &peer_entries,
         }
     }
 
+    // Report the availability spread. A range wider than one means some pieces
+    // really are scarcer than others, which is the condition under which the
+    // rarest-first ordering below changes anything at all.
+    {
+        int lo = avail_count[0], hi = avail_count[0];
+        for (size_t i = 1; i < num_pieces; ++i)
+        {
+            lo = min(lo, avail_count[i]);
+            hi = max(hi, avail_count[i]);
+        }
+        size_t scarce = 0;
+        for (size_t i = 0; i < num_pieces; ++i)
+            if (avail_count[i] == lo)
+                ++scarce;
+        cerr << "[dl] availability: " << lo << ".." << hi << " peers per piece; "
+             << scarce << "/" << num_pieces << " piece(s) at the minimum"
+             << (hi > lo ? " (rarest-first will prioritise these)" : " (uniform, ordering is a no-op)")
+             << "\n";
+    }
+
     // Step 3: prepare .part file
     string partpath = destpath + ".part";
     int partfd = open(partpath.c_str(), O_CREAT | O_WRONLY, 0644);
@@ -1067,6 +1055,18 @@ bool download_manager_multipeer(const vector<string> &peer_entries,
     {
         // not fatal
     }
+
+    // Publish this download as a partial share straight away, so other peers
+    // can start pulling finished pieces off us while we are still fetching the
+    // rest. This is what creates uneven piece availability in the swarm and so
+    // gives the rarest-first ordering below something real to work with.
+    string my_owner;
+    {
+        lock_guard<mutex> lg(current_user_mtx);
+        my_owner = current_user;
+    }
+    auto my_share = register_partial_share(filename, my_owner, partpath,
+                                           filesize, num_pieces);
 
     // piece state
     enum PieceState
@@ -1102,6 +1102,7 @@ bool download_manager_multipeer(const vector<string> &peer_entries,
     condition_variable q_cv;
     atomic<bool> abort_flag{false};
     atomic<size_t> done_count{0};
+    mutex print_mtx; // keeps the "which peer served which piece" log lines from interleaving
 
     // decide pool size from hardware_concurrency (I/O-bound, modest multiplier)
     unsigned hw = thread::hardware_concurrency();
@@ -1197,7 +1198,20 @@ bool download_manager_multipeer(const vector<string> &peer_entries,
                                       size_t ridx;
                                       ssize_t rlen;
                                       ih >> kw >> ridx >> rlen;
-                                      if (kw != "PIECE" || ridx != (size_t)piece_idx || rlen <= 0)
+                                      // The manifest fixes this piece's exact
+                                      // length, so demand that rather than
+                                      // trusting the peer. Sizing the buffer
+                                      // below from an unchecked wire value lets
+                                      // any peer answering, say,
+                                      // "PIECE 3 999999999999" trigger an
+                                      // allocation failure on this detached
+                                      // worker thread and kill the process,
+                                      // taking every other download with it.
+                                      off_t piece_off = (off_t)piece_idx * (off_t)PIECE_SIZE;
+                                      ssize_t expect_len = (ssize_t)min<off_t>(
+                                          (off_t)PIECE_SIZE, (off_t)filesize - piece_off);
+                                      if (kw != "PIECE" || ridx != (size_t)piece_idx ||
+                                          rlen != expect_len)
                                       {
                                           close(s);
                                           continue;
@@ -1251,12 +1265,26 @@ bool download_manager_multipeer(const vector<string> &peer_entries,
                                       }
 
                                       // success for this piece
+                                      {
+                                          string who = peer->owner.empty() ? peer->addr : (peer->owner + "@" + peer->addr);
+                                          lock_guard<mutex> plg(print_mtx);
+                                          cout << "[piece " << piece_idx << "/" << (num_pieces - 1)
+                                               << "] <- " << who << "\n" << flush;
+                                      }
                                       pstate[piece_idx].state = DONE;
                                       done_count.fetch_add(1);
                                       if (job)
                                       {
                                           job->downloaded.fetch_add((uint64_t)buf.size());
                                           job->done_pieces.fetch_add(1);
+                                      }
+
+                                      // The piece is verified and on disk, so we
+                                      // can now serve it to other peers. Marked
+                                      // only after the pwrite above succeeds.
+                                      {
+                                          lock_guard<mutex> slg(my_share->mtx);
+                                          my_share->have[piece_idx] = 1;
                                       }
 
                                       // update availability counts and mark peers as not offering this piece further
@@ -1373,101 +1401,32 @@ bool download_manager_multipeer(const vector<string> &peer_entries,
         if (rename(partpath.c_str(), destpath.c_str()) != 0)
         {
             cerr << "[dl] rename failed: " << strerror(errno) << "\n";
+            unregister_partial_share(filename, my_owner);
             return false;
         }
+
+        // We are already announced to the tracker as a seeder, so there must
+        // never be an instant where we advertise this file but cannot serve
+        // any of it. The rename just moved the bytes out from under the
+        // partial share, so re-point it at the final path and mark it whole,
+        // then register the normal full share, and only then drop the partial
+        // one. Doing this in the other order leaves a hole that lasts as long
+        // as the caller's post-download verification, which for a large file
+        // is long enough for another peer to exhaust its retries against us.
+        {
+            lock_guard<mutex> slg(my_share->mtx);
+            my_share->partpath = destpath;
+            fill(my_share->have.begin(), my_share->have.end(), (char)1);
+        }
+        register_shared_file_both(filename, destpath, my_owner);
+        unregister_partial_share(filename, my_owner);
         return true;
     }
     else
     {
-        // keep .part for debugging/resume or unlink if you prefer
+        unregister_partial_share(filename, my_owner);
         return false;
     }
-}
-
-void background_download_worker(shared_ptr<DownloadJob> job,
-                                const vector<string> &trackers,
-                                int last_try_idx,
-                                const string &my_peer_addr)
-{
-    job->status.store(DLStatus::RUNNING);
-
-    // 1) fetch manifest from tracker
-    int sock = -1;
-    uint64_t filesize = 0;
-    string fullsha1;
-    vector<string> piece_hashes;
-    vector<string> peer_entries;
-
-    auto get_manifest_from_tracker = [&](int &sock_ref) -> bool
-    {
-        if (sock_ref < 0)
-        {
-            int idx;
-            sock_ref = connect_any_tracker(trackers, last_try_idx, idx);
-            if (sock_ref < 0)
-                return false;
-        }
-        string getm = "get_manifest " + job->gid + " " + job->filename;
-        if (!send_line(sock_ref, getm))
-        {
-            close(sock_ref);
-            sock_ref = -1;
-            return false;
-        }
-        string trep;
-        if (!recv_line(sock_ref, trep))
-        {
-            close(sock_ref);
-            sock_ref = -1;
-            return false;
-        }
-        job->last_tracker_reply = trep;
-        if (!parse_manifest_line(trep, filesize, fullsha1, piece_hashes, peer_entries))
-            return false;
-        return true;
-    };
-
-    if (!get_manifest_from_tracker(sock))
-    {
-        job->status.store(DLStatus::FAILED);
-        job->error_msg = "cannot_fetch_manifest";
-        return;
-    }
-    job->total_bytes = filesize;
-    job->total_pieces = piece_hashes.size();
-
-    // 2) call the multipeer manager, passing job for progress updates
-    bool ok = download_manager_multipeer(peer_entries, job->filename, job->destpath,
-                                         filesize, piece_hashes, fullsha1, job);
-
-    if (!ok)
-    {
-        job->status.store(DLStatus::FAILED);
-        job->error_msg = "download_failed";
-        return;
-    }
-
-    // 3) verify and compute piece+full shas (optional since manager already validated)
-    uint64_t new_filesize = 0;
-    string new_fullsha1;
-    vector<string> new_piece_sha1s;
-    if (!compute_piece_and_file_sha1(job->destpath, new_filesize, new_fullsha1, new_piece_sha1s))
-    {
-        job->status.store(DLStatus::FAILED);
-        job->error_msg = "compute_sha_failed";
-        return;
-    }
-
-    // NOTE: we intentionally do NOT auto-register or announce the file to the tracker here.
-    // The user requested manual upload after download completes. The file has been renamed
-    // to job->destpath by the manager, so it is available locally on disk.
-
-    // Provide a helpful message so the caller/UI can see what to do next:
-    job->status.store(DLStatus::SUCCESS);
-
-    // If you want, you can set a user-visible hint with the full sha and piece list:
-    // (optional) store them in job->error_msg or other job fields for UI
-    // job->error_msg = "run: upload_file <gid> <path>";
 }
 
 // ---------------- connect helpers ----------------
@@ -1529,7 +1488,57 @@ int connect_any_tracker(const vector<string> &trackers, int start_idx, int &out_
     return -1;
 }
 
-// ---------------- trim helper ----------------
+// trim helper
+// Connect to any tracker, re-login on that fresh socket, send one command and
+// return its reply. Background threads need this because a tracker session is
+// bound to the socket it logged in on, so a new connection is unauthenticated.
+static bool tracker_announce(const vector<string> &trackers, int start_idx,
+                             const string &command, string *reply = nullptr)
+{
+    int tidx = -1;
+    int tsock = connect_any_tracker(trackers, start_idx, tidx);
+    if (tsock < 0)
+    {
+        log_to_file_sync("[announce] no tracker reachable for: " + command);
+        return false;
+    }
+
+    string user, pass;
+    {
+        lock_guard<mutex> lg(current_user_mtx);
+        user = current_user;
+        pass = current_pass;
+    }
+    if (user.empty() || pass.empty())
+    {
+        log_to_file_sync("[announce] no stored credentials, cannot authenticate");
+        close(tsock);
+        return false;
+    }
+
+    string lrep;
+    if (!send_line(tsock, "login " + user + " " + pass) || !recv_line(tsock, lrep) ||
+        lrep.rfind("OK", 0) != 0)
+    {
+        log_to_file_sync("[announce] re-login failed: " + lrep);
+        close(tsock);
+        return false;
+    }
+
+    string rep;
+    bool ok = send_line(tsock, command) && recv_line(tsock, rep);
+    close(tsock);
+    if (!ok)
+    {
+        log_to_file_sync("[announce] send/recv failed for: " + command);
+        return false;
+    }
+    log_to_file_sync("[announce] tracker replied: " + rep);
+    if (reply)
+        *reply = rep;
+    return rep.rfind("OK", 0) == 0;
+}
+
 static inline string trim_copy(const string &s)
 {
     size_t a = s.find_first_not_of(" \t\r\n");
@@ -1539,7 +1548,8 @@ static inline string trim_copy(const string &s)
     return s.substr(a, b - a + 1);
 }
 
-// ---------------- main client loop ----------------
+// main client loop
+
 int main(int argc, char **argv)
 {
     ios::sync_with_stdio(false);
@@ -1556,10 +1566,9 @@ int main(int argc, char **argv)
         std::cerr << "Logging to client.log\n";
     }
 
-    // --- parse CLI args: optional first arg is peer token IP:PORT, second is tracker file
     string trackers_file = "tracker_info.txt";
-    string requested_peer_token; // e.g. "192.168.1.10:9000"
-    string bind_ip;              // ip part to bind to
+    string requested_peer_token;
+    string bind_ip;              
     unsigned short requested_port = 0;
 
     if (argc >= 3)
@@ -1612,7 +1621,7 @@ int main(int argc, char **argv)
     string my_peer_addr;
     if (!requested_peer_token.empty())
     {
-        // if the user specified a full token with port, use it; otherwise attach chosen port
+        // if the user specified a full token with port, we will use it; otherwise attach chosen port
         size_t p = requested_peer_token.find_last_of(':');
         if (p != string::npos && p + 1 < requested_peer_token.size())
         {
@@ -1670,7 +1679,6 @@ int main(int argc, char **argv)
 
     cout << "Type commands : Example: create_user alice pass\n";
     cout << "Type quit or exit to stop.\n";
-
     string raw;
     while (true)
     {
@@ -1689,6 +1697,42 @@ int main(int argc, char **argv)
         string tk;
         while (iss0 >> tk)
             tokens.push_back(tk);
+        
+        if (!tokens.empty() && tokens[0] == "show_seeders") {
+            if (tokens.size() < 3) {
+                cout << "ERR missing_args. Usage: show_seeders <group_id> <filename>\n";
+                continue;
+            }
+            string gid = tokens[1];
+            string fname = tokens[2];
+            // Ask tracker for manifest (we only care about peer list part)
+            string cmd = "get_manifest " + gid + " " + fname;
+            if (!send_line(sock, cmd)) {
+                cout << "ERR tracker_send_failed\n";
+                continue;
+            }
+            string trep;
+            if (!recv_line(sock, trep)) {
+                cout << "ERR tracker_no_reply\n";
+                continue;
+            }
+
+            uint64_t filesize = 0;
+            string fullsha1;
+            vector<string> piece_hashes;
+            vector<string> peer_entries;
+            if (!parse_manifest_line(trep, filesize, fullsha1, piece_hashes, peer_entries)) {
+                cout << "ERR manifest_parse_failed\n";
+                continue;
+            }
+
+            cout << "[Seeders for " << gid << ":" << fname << "]\n";
+            for (auto &p : peer_entries) {
+                cout << "  " << p << "\n";   // prints like alice@127.0.0.1:5002
+            }
+            continue; // don't forward this to tracker again
+        }
+
 
         // Intercept upload_file to compute piece+file SHA1s and rewrite the line
         if (!tokens.empty() && tokens[0] == "upload_file")
@@ -1727,10 +1771,6 @@ int main(int argc, char **argv)
                 {
                     string owner_key = current_user + ":" + fname;
                     register_shared_file(owner_key, filepath);
-                }
-                else
-                {
-                    // Not logged in: still register basename only (legacy)
                 }
             }
 
@@ -1808,7 +1848,6 @@ int main(int argc, char **argv)
                     if (local_uploaded_gid.count(key)) local_uploaded_gid.erase(key);
                 }
             } else {
-                // not OK — tracker refused; do not remove local sharing
                 cout << "[stop_share] tracker refused or error\n";
             }
 
@@ -1843,10 +1882,10 @@ int main(int argc, char **argv)
                 }
             }
 
-            // IMPORTANT: don't forward this command to the tracker; we've handled it locally.
+            //We don't forward this command to the tracker; we've handled it locally.
             continue;
         }
-
+        
 
         // intercept download_file <group_id> <filename> <destpath>
         if (!tokens.empty() && tokens[0] == "download_file")
@@ -1916,6 +1955,29 @@ int main(int argc, char **argv)
             }
             cout << "[dl] starting background download (id will be returned) — will fetch from peers: " << chosen_peer_addr << "\n";
 
+            // Announce ourselves as a seeder for this file *now*, before a
+            // single byte has arrived. We already hold the full manifest, so we
+            // can republish it verbatim with our own address appended.
+            //
+            // Registering up front is what lets a later downloader discover us
+            // mid-transfer and pull the pieces we have already verified. Our
+            // QUERY_HAVE reply reports the real piece set, so nobody is misled
+            // into asking us for a piece we do not hold yet.
+            {
+                ostringstream ann;
+                ann << "upload_file " << gid << " " << fname << " " << filesize
+                    << " " << fullsha1 << " " << piece_hashes.size()
+                    << " " << my_peer_addr;
+                for (auto &ph : piece_hashes)
+                    ann << " " << ph;
+                if (send_line(sock, ann.str()))
+                {
+                    string arep;
+                    if (recv_line(sock, arep))
+                        cout << "[dl] announced as partial seeder: " << arep << "\n";
+                }
+            }
+
             // create job and register it in global downloads map
             auto job = make_shared<DownloadJob>();
             job->gid = gid;
@@ -1967,6 +2029,11 @@ int main(int argc, char **argv)
                                                         job);
 
                     if (!ok) {
+                        // We announced ourselves as a seeder before starting, so
+                        // withdraw that now. Leaving the entry behind would send
+                        // other peers to an address holding nothing.
+                        tracker_announce(trackers_copy, last_try_copy,
+                                         "stop_share " + gid_copy + " " + fname_copy);
                         job->status.store(DLStatus::FAILED);
                         job->error_msg = "download_failed";
                         return;
@@ -2075,9 +2142,8 @@ int main(int argc, char **argv)
                     job->status.store(DLStatus::FAILED);
                 } });
 
-            // NOTE: we intentionally do NOT detach the thread — it is stored in job->worker so the main
-            // program can join on shutdown. If you prefer detached lifetime, call job->worker.detach() here.
-
+            // we intentionally do NOT detach the thread — it is stored in job->worker so the main
+            // program can join on shutdown. 
             cout << "OK download_started id=" << job->id << "\n";
             continue; // do not send original command to tracker
         }

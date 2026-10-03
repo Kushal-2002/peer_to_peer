@@ -1,0 +1,29 @@
+# ---- compiled binaries ----
+tracker/tracker
+client/client
+*.o
+*.out
+
+# ---- runtime state ----
+*.journal
+*.part
+client/client.log
+*.log
+
+# ---- test / sample media (regenerate with the benchmark instead) ----
+client/bit_copy.mp4
+*.mp4
+
+# ---- local working files, not part of the project ----
+.cleanup_backup/
+INTERVIEW_BRIEF.html
+
+# ---- course material and report drafts ----
+*.pdf
+PROJECT_REPORT.tex
+
+# ---- editor / OS noise ----
+.DS_Store
+.vscode/
+__pycache__/
+*.pyc

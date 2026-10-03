@@ -22,6 +22,11 @@
 
 #include <atomic>
 #include <fcntl.h>
+
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+using namespace std; 
 // ...
 std::atomic<bool> running{true};
 
@@ -37,9 +42,6 @@ void safe_close_listen_fd()
     }
 }
 
-using namespace std;
-
-// ---------------- basic types ----------------
 struct Group
 {
     string owner;
@@ -51,7 +53,7 @@ struct Group
 struct FileManifest
 {
     string filename; // name only (unique per group)
-    string filepath; // optional original path / info
+    string filepath;
     uint64_t filesize = 0;
     string full_sha1;
     vector<string> piece_sha1s;
@@ -103,11 +105,141 @@ mutex sessions_mtx;
 vector<int> peer_fds; // connected peer sockets (both inbound and outbound)
 mutex peer_fds_mtx;
 
-// ---------------- in-memory journal (no file) ----------------
+// ---------------- operation log ----------------
+// Every state mutation is appended to a durable journal file before it counts
+// as applied, so a restarted tracker rebuilds users/groups/manifests by
+// replaying that file. The in-memory copy is what we stream to a peer tracker
+// when a sync link comes up.
 unordered_set<string> journal_lines_set;
 mutex journal_set_mtx;
 vector<string> journal_lines;
 mutex journal_lines_mtx;
+
+string journal_path;            // set once in main(), before any mutator runs
+int journal_fd = -1;            // append-only, fsync'd on every record
+mutex journal_file_mtx;
+bool journal_replaying = false; // true while replaying: don't rewrite the file
+
+// ---------------- password hashing (PBKDF2-HMAC-SHA256) ----------------
+// Stored form: pbkdf2$sha256$<iterations>$<salt_hex>$<hash_hex>
+// The tracker that first sees the plaintext does the hashing, and the encoded
+// string is what travels over the sync link and lands in the journal, so no
+// tracker ever writes a plaintext password to disk or to the network.
+static const int PBKDF2_ITERATIONS = 100000;
+static const size_t PBKDF2_SALT_LEN = 16;
+static const size_t PBKDF2_HASH_LEN = 32;
+
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+static string to_hex(const unsigned char *buf, size_t len)
+{
+    static const char *hexd = "0123456789abcdef";
+    string out;
+    out.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i)
+    {
+        out.push_back(hexd[(buf[i] >> 4) & 0xF]);
+        out.push_back(hexd[buf[i] & 0xF]);
+    }
+    return out;
+}
+
+static bool from_hex(const string &hex, vector<unsigned char> &out)
+{
+    if (hex.empty() || hex.size() % 2 != 0)
+        return false;
+    out.clear();
+    out.reserve(hex.size() / 2);
+    for (size_t i = 0; i < hex.size(); i += 2)
+    {
+        int hi = hexval(hex[i]), lo = hexval(hex[i + 1]);
+        if (hi < 0 || lo < 0)
+            return false;
+        out.push_back((unsigned char)((hi << 4) | lo));
+    }
+    return true;
+}
+
+// Returns the encoded credential, or an empty string if the RNG or the KDF failed.
+string hash_password(const string &plaintext)
+{
+    unsigned char salt[PBKDF2_SALT_LEN];
+    if (RAND_bytes(salt, (int)PBKDF2_SALT_LEN) != 1)
+    {
+        cerr << "[auth] RAND_bytes failed\n";
+        return string();
+    }
+    unsigned char digest[PBKDF2_HASH_LEN];
+    if (PKCS5_PBKDF2_HMAC(plaintext.data(), (int)plaintext.size(),
+                          salt, (int)PBKDF2_SALT_LEN,
+                          PBKDF2_ITERATIONS, EVP_sha256(),
+                          (int)PBKDF2_HASH_LEN, digest) != 1)
+    {
+        cerr << "[auth] PBKDF2 failed\n";
+        return string();
+    }
+    ostringstream oss;
+    oss << "pbkdf2$sha256$" << PBKDF2_ITERATIONS << "$"
+        << to_hex(salt, PBKDF2_SALT_LEN) << "$"
+        << to_hex(digest, PBKDF2_HASH_LEN);
+    return oss.str();
+}
+
+// Recomputes the KDF with the stored salt and iteration count, then compares
+// in constant time so a wrong guess cannot be timed byte by byte.
+bool verify_password(const string &encoded, const string &plaintext)
+{
+    vector<string> parts;
+    {
+        string cur;
+        for (char c : encoded)
+        {
+            if (c == '$')
+            {
+                parts.push_back(cur);
+                cur.clear();
+            }
+            else
+                cur.push_back(c);
+        }
+        parts.push_back(cur);
+    }
+    if (parts.size() != 5 || parts[0] != "pbkdf2" || parts[1] != "sha256")
+        return false;
+
+    int iters = 0;
+    try
+    {
+        iters = stoi(parts[2]);
+    }
+    catch (...)
+    {
+        return false;
+    }
+    if (iters <= 0)
+        return false;
+
+    vector<unsigned char> salt, expected;
+    if (!from_hex(parts[3], salt) || !from_hex(parts[4], expected))
+        return false;
+
+    vector<unsigned char> got(expected.size());
+    if (PKCS5_PBKDF2_HMAC(plaintext.data(), (int)plaintext.size(),
+                          salt.data(), (int)salt.size(),
+                          iters, EVP_sha256(),
+                          (int)got.size(), got.data()) != 1)
+        return false;
+    return CRYPTO_memcmp(got.data(), expected.data(), got.size()) == 0;
+}
 
 // ---------------- socket helpers ----------------
 bool send_all(int fd, const string &s)
@@ -210,26 +342,138 @@ void cleanup_fd(int fd)
 }
 
 // ---------------- journal helpers ----------------
+void handle_sync_line(const string &line); // replay feeds records back through this
+
+// Appends one record to the journal file and flushes it to stable storage.
+// Returns false if either step failed, in which case the caller must not treat
+// the mutation as committed.
+static bool journal_write_record(const string &line)
+{
+    lock_guard<mutex> lg(journal_file_mtx);
+    if (journal_fd < 0)
+    {
+        cerr << "[journal] no open journal, refusing to apply: " << line << "\n";
+        return false;
+    }
+    string rec = line;
+    rec.push_back('\n');
+    const char *ptr = rec.data();
+    size_t left = rec.size();
+    while (left > 0)
+    {
+        ssize_t n = write(journal_fd, ptr, left);
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            cerr << "[journal] write failed: " << strerror(errno) << "\n";
+            return false;
+        }
+        ptr += n;
+        left -= (size_t)n;
+    }
+    if (fsync(journal_fd) != 0)
+    {
+        cerr << "[journal] fsync failed: " << strerror(errno) << "\n";
+        return false;
+    }
+    return true;
+}
+
 bool append_journal_line_if_new(const string &line)
 {
     lock_guard<mutex> lg(journal_set_mtx);
     if (journal_lines_set.count(line))
         return true;
+    // Durability first: the record has to survive a crash before we count it as
+    // applied. During replay we are reading that same file, so skip the write.
+    if (!journal_replaying && !journal_write_record(line))
+        return false;
     {
         lock_guard<mutex> lg2(journal_lines_mtx);
         journal_lines.push_back(line);
     }
     journal_lines_set.insert(line);
-    cerr << "[journal] appended: " << line << "\n";
     return true;
 }
-void load_journal_into_set()
+
+// Rebuilds in-memory state from the journal file, then reopens it for append.
+// Must run before any thread that can mutate state is started, which is why the
+// replaying flag needs no lock.
+bool open_and_replay_journal(const string &path)
 {
-    lock_guard<mutex> lg(journal_set_mtx);
-    journal_lines_set.clear();
-    lock_guard<mutex> lg2(journal_lines_mtx);
-    journal_lines.clear();
+    journal_path = path;
+    size_t replayed = 0;
+
+    int rfd = open(path.c_str(), O_RDONLY);
+    if (rfd < 0 && errno != ENOENT)
+    {
+        cerr << "[journal] cannot read " << path << ": " << strerror(errno) << "\n";
+        return false;
+    }
+    if (rfd >= 0)
+    {
+        string content;
+        vector<char> buf(64 * 1024);
+        while (true)
+        {
+            ssize_t r = read(rfd, buf.data(), buf.size());
+            if (r < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                cerr << "[journal] read failed: " << strerror(errno) << "\n";
+                close(rfd);
+                return false;
+            }
+            if (r == 0)
+                break;
+            content.append(buf.data(), (size_t)r);
+        }
+        close(rfd);
+
+        // Every complete record ends in a newline because we fsync after each
+        // one, so trailing bytes without a newline are a torn write from a crash
+        // mid-append. Drop them and cut the file back, otherwise the next append
+        // would glue itself onto a half-written record.
+        if (!content.empty() && content.back() != '\n')
+        {
+            size_t last = content.find_last_of('\n');
+            size_t keep = (last == string::npos) ? 0 : last + 1;
+            cerr << "[journal] discarding " << (content.size() - keep)
+                 << " bytes of torn trailing record\n";
+            content.resize(keep);
+            if (truncate(path.c_str(), (off_t)keep) != 0)
+                cerr << "[journal] truncate failed: " << strerror(errno) << "\n";
+        }
+
+        journal_replaying = true;
+        size_t pos = 0;
+        while (pos < content.size())
+        {
+            size_t eol = content.find('\n', pos);
+            string line = content.substr(pos, eol - pos);
+            pos = eol + 1;
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            if (line.empty())
+                continue;
+            handle_sync_line(line);
+            ++replayed;
+        }
+        journal_replaying = false;
+    }
+
+    journal_fd = open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (journal_fd < 0)
+    {
+        cerr << "[journal] cannot open " << path << " for append: " << strerror(errno) << "\n";
+        return false;
+    }
+    cerr << "[journal] " << path << ": replayed " << replayed << " record(s)\n";
+    return true;
 }
+
 vector<string> read_journal_lines()
 {
     lock_guard<mutex> lg(journal_lines_mtx);
@@ -237,7 +481,7 @@ vector<string> read_journal_lines()
 }
 
 // ---------------- forward declarations of apply_ helpers ----------------
-string apply_create_user(const string &uid, const string &pwd, bool from_sync);
+string apply_create_user(const string &uid, const string &cred, bool from_sync);
 string apply_create_group(const string &gid, const string &owner, bool from_sync);
 string apply_accept_request(const string &gid, const string &uid, const string &owner, bool from_sync);
 string apply_join_request(const string &gid, const string &uid, bool from_sync);
@@ -252,24 +496,43 @@ void handle_create_user(int fd, const vector<string> &args)
         return;
     }
     string uid = args[1], pwd = args[2];
-    string res = apply_create_user(uid, pwd, false);
+    if (uid.empty() || pwd.empty())
+    {
+        send_line(fd, "ERR missing_args");
+        return;
+    }
+    // Hash at the edge, where the plaintext arrives, so it never reaches the
+    // users map, the journal file, the sync link, or another tracker's memory.
+    string cred = hash_password(pwd);
+    if (cred.empty())
+    {
+        send_line(fd, "ERR internal_error");
+        return;
+    }
+    //For tracker syncronization other trackers should know about the current operations
+    string res = apply_create_user(uid, cred, false);
     send_line(fd, res);
 }
-string apply_create_user(const string &uid, const string &pwd, bool from_sync)
+// `cred` is always the encoded PBKDF2 credential from hash_password(), never a
+// plaintext password: it is what gets stored, journaled and replicated.
+string apply_create_user(const string &uid, const string &cred, bool from_sync)
 {
-    if (uid.empty() || pwd.empty())
+    if (uid.empty() || cred.empty())
         return "ERR missing_args";
     {
         lock_guard<mutex> lg(users_mtx);
         if (users.count(uid))
             return "ERR user_exists";
-        users[uid] = pwd;
+        users[uid] = cred;
     }
     if (!from_sync)
     {
-        string line = "SYNC_CREATE_USER " + uid + " " + pwd;
+        string line = "SYNC_CREATE_USER " + uid + " " + cred;
+        //Appending to journal so that in case of restarting the tracker we can get back the operations that we had performed
+
         append_journal_line_if_new(line);
         lock_guard<mutex> lg(peer_fds_mtx);
+        //Tell other trackers about the current operation
         for (int pfd : peer_fds)
             send_line(pfd, line);
     }
@@ -285,8 +548,16 @@ void handle_login(int fd, const vector<string> &args)
     }
     string uid = args[1], pwd = args[2];
     {
-        lock_guard<mutex> lg(users_mtx);
-        if (!users.count(uid) || users[uid] != pwd)
+        string cred;
+        {
+            lock_guard<mutex> lg(users_mtx);
+            auto it = users.find(uid);
+            if (it != users.end())
+                cred = it->second;
+        }
+        // Run the KDF outside the lock; it is deliberately slow and would
+        // otherwise serialise every concurrent login behind one mutex.
+        if (cred.empty() || !verify_password(cred, pwd))
         {
             send_line(fd, "ERR invalid_credentials");
             return;
@@ -585,11 +856,6 @@ void handle_logout(int fd, const vector<string> &args)
 
 // ---------------- file-operation handlers ----------------
 
-// get_manifest <group_id> <filename>
-
-// reply:
-// OK manifest <filesize> <fullsha1> <num_pieces> <peer1,peer2,...> <piece1> <piece2> ...
-// or ERR no_such_file / ERR no_such_group / ERR login_required / ERR not_member
 void handle_get_manifest(int fd, const vector<string> &args)
 {
     if (args.size() < 3)
@@ -1007,6 +1273,8 @@ void dispatch_command(int fd, const vector<string> &tokens)
         handle_stop_share(fd, tokens);
     else if (cmd == "get_manifest")
         handle_get_manifest(fd, tokens);
+    
+
     else
         send_line(fd, "ERR unknown_cmd");
 }
@@ -1271,28 +1539,14 @@ void peer_connector_thread(const string &peer_addr)
     }
 }
 
-void handle_client(int client_fd)
-{
-    string line;
-    while (recv_line(client_fd, line))
-    {
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (line.empty())
-            continue;
-        vector<string> tokens = split_tokens(line);
-        dispatch_command(client_fd, tokens);
-    }
-    cleanup_fd(client_fd);
-    close(client_fd);
-}
-
 int main(int argc, char **argv)
 {
+    //Used for getting the tracker info
     if (argc < 3)
     {
-        cerr << "Usage: " << argv[0] << " <tracker_info.txt> <my_index>\n";
+        cerr << "Usage: " << argv[0] << " <tracker_info.txt> <my_index> [journal_file]\n";
         cerr << "Example: " << argv[0] << " tracker_info.txt 0\n";
+        cerr << "  journal_file defaults to tracker_<my_index>.journal\n";
         return 1;
     }
 
@@ -1377,6 +1631,16 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // Recover our own state from disk before any sync link opens, so a peer that
+    // connects immediately sees a tracker that already knows what it knew before
+    // the restart. Running single-threaded here is also what lets the replaying
+    // flag go unlocked.
+    string journal_file = (argc >= 4) ? string(argv[3])
+                                      : ("tracker_" + to_string(my_index) + ".journal");
+    if (!open_and_replay_journal(journal_file))
+        return 1;
+    cerr << "[sync] journal holds " << journal_lines_set.size() << " record(s)\n";
+
     // Launch connector threads for every other tracker entry so we form sync links.
     for (size_t i = 0; i < tracker_addrs.size(); ++i) {
         if ((int)i == my_index) continue;
@@ -1388,11 +1652,7 @@ int main(int argc, char **argv)
     }
 
 
-    load_journal_into_set();
-    cerr << "[sync] in-memory journal initialized (" << journal_lines_set.size() << " entries)\n";
-
-
-
+    
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0)
     {
@@ -1414,7 +1674,7 @@ int main(int argc, char **argv)
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port);
 
-    if (bind(listen_fd, (sockaddr *)&addr, sizeof(addr)) < 0)
+    if (::bind(listen_fd, (sockaddr *)&addr, sizeof(addr)) < 0)
     {
         perror("bind");
         close(listen_fd);
@@ -1503,5 +1763,14 @@ int main(int argc, char **argv)
     }
 
     close(listen_fd);
+    {
+        lock_guard<mutex> lg(journal_file_mtx);
+        if (journal_fd >= 0)
+        {
+            fsync(journal_fd);
+            close(journal_fd);
+            journal_fd = -1;
+        }
+    }
     return 0;
 }
