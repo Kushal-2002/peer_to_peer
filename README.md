@@ -6,7 +6,7 @@ downloaded in parallel from multiple peers at once. A replicated metadata tracke
 handles authentication, group membership and peer discovery over TLS — but never
 carries file data.
 
-No external frameworks. ~4,900 lines of C++ across two binaries, plus a Python
+No external frameworks. ~5,000 lines of C++ across two binaries, plus a Python
 benchmark harness that drives the real processes.
 
 ---
@@ -177,6 +177,41 @@ expires, because nothing is looked up to validate it. `logout` records the token
 in an in-memory revocation set, which is per-tracker and lost on restart. Expiry
 (12 hours by default) is the real bound; revocation is best-effort.
 
+### Filenames with spaces
+
+Every protocol here is newline-delimited text split on whitespace, so a filename
+containing a space used to be torn into two fields and the command simply failed.
+Two separate things had to change.
+
+**What you type.** The client's command parser now honours double quotes and a
+backslash escape, so a path with spaces is given as `"my holiday video.mp4"` or
+`my\ holiday\ video.mp4`. Unquoted input splits on whitespace exactly as before.
+
+**What goes on the wire.** Filenames are percent-encoded whenever they are
+transmitted — tracker commands, sync records, the journal, and the peer protocol
+— which keeps each one a single whitespace-free token:
+
+```
+upload_file vids my%20holiday%20video.mp4 2500000 <sha1> 5 ...
+QUERY_HAVE seeder my%20holiday%20video.mp4
+```
+
+In memory, and in anything shown to a user, a filename is always the real decoded
+name. Encoding happens at the moment of transmission and decoding immediately on
+receipt, so `list_files` prints `my holiday video.mp4`, not the escaped form.
+
+Only `%` and characters that would break tokenisation or line framing are
+escaped, and decoding treats `%` as an escape only when followed by two valid hex
+digits — so a name that was never encoded decodes to itself, which keeps journals
+written before this change replayable.
+
+A length-prefixed binary framing would also solve this, and would handle
+arbitrary bytes without needing an escape character at all. It was not chosen
+because every tracker handler receives a pre-split `vector<string>`: length
+prefixes would mean parsing each message field by field instead, rewriting every
+handler rather than adding two helpers. The text protocol also stays readable on
+the wire, which is worth keeping.
+
 ---
 
 ## Build
@@ -330,8 +365,8 @@ first one lands.
 | `list_requests <gid>` | Pending join requests (owner only). |
 | `accept_request <gid> <user>` | Approve a request (owner only). |
 | `list_files <gid>` | Files shared in a group. |
-| `upload_file <gid> <file_path>` | Hash the file locally and announce it. |
-| `download_file <gid> <filename> <dest>` | Multi-peer parallel download. |
+| `upload_file <gid> <file_path>` | Hash the file locally and announce it. Quote paths containing spaces: `upload_file g "my file.bin"`. |
+| `download_file <gid> <filename> <dest>` | Multi-peer parallel download. Quote names containing spaces. |
 | `show_downloads` | Status of all download jobs. |
 | `show_seeders <gid> <filename>` | Which peers currently hold the file. |
 | `stop_share <gid> <filename>` | Stop seeding a file. |
@@ -384,40 +419,44 @@ written to `results.csv`.
 
 ### Measured — 16 MB file, 6 trials each, loopback, single machine
 
-Peer scaling, one downloader. Every figure below is recomputable from the
-committed `results.csv`:
+Peer scaling, one downloader. Recomputable from the committed `results.csv`:
 
 | Seeders | Mean | Range | Spread | vs. 1 seeder |
 |---|---|---|---|---|
-| 1 | 246.00 MB/s | 217.4 – 260.1 | 17% | — |
-| 2 | 419.31 MB/s | 335.7 – 449.1 | 27% | **1.70×** |
-| 4 | 414.43 MB/s | 321.9 – 454.1 | 32% | 1.68× |
+| 1 | 230.79 MB/s | 211.8 – 256.6 | 19% | — |
+| 2 | 432.12 MB/s | 426.3 – 436.8 | 2% | **1.87×** |
+| 4 | 424.32 MB/s | 422.8 – 426.8 | 1% | 1.84× |
 
-**A second seeder makes the download roughly 1.7× faster.** A third and fourth
-add nothing: on a single machine every seeder reads the same file from the same
-disk, so two are enough to saturate it and the bottleneck moves from peer
-availability onto that device. On separate hosts with independent disks the curve
-would be expected to keep rising.
+**A second seeder roughly doubles throughput.** A third and fourth add nothing:
+on a single machine every seeder reads the same file from the same disk, so two
+are enough to saturate it and the bottleneck moves from peer availability onto
+that device. On separate hosts with independent disks the curve would be expected
+to keep rising.
 
-The spread column is there on purpose — it is 17–32%, which is large, so treat
-1.7× as approximate rather than precise. Measuring this honestly took three
-attempts and the answer moved each time:
+**The honest figure is 1.7×–1.9×, not a single number.** Repeating the whole
+6-trial sweep gives a different ratio each time — 1.70× on one run, 1.87× on the
+next — and the spread column shows why. The multi-seeder measurements are tight
+(1–2%), but the *single-seeder* baseline varies 19% run to run, and it is the
+denominator. Chasing a precise ratio would mean many more trials against a
+baseline that is inherently noisy on a shared laptop; quoting the range is the
+more defensible claim.
+
+Getting even that far took three attempts:
 
 | Attempt | Setup | Result |
 |---|---|---|
-| 1 | 2 MB, 1 trial | 1.5× — pure noise; a repeat run showed 2 seeders *slower* |
-| 2 | 16 MB, 3 trials | 1.45× — sample caught a low outlier |
-| 3 | 16 MB, 6 trials | **1.70×** — with the variance above now visible |
+| 1 | 2 MB, 1 trial | 1.5× — pure noise. A repeat showed 2 seeders *slower* than 1. |
+| 2 | 16 MB, 3 trials | 1.45× — the sample caught a low outlier. |
+| 3 | 16 MB, 6 trials, repeated | **1.7×–1.9×**, with the variance finally visible. |
 
 At 2 MB the file is four pieces and the transfer takes under 30 ms, so run-to-run
-variance swamps the effect entirely. Even at 16 MB the single-seeder case varies
-17% between runs. The lesson, which matters more than the number: a scaling claim
-needs a file large enough for the signal to exceed the variance, enough trials to
-see past it, and the spread reported alongside the mean.
+variance swamps the effect entirely. The lesson matters more than the number: a
+scaling claim needs a file large enough for the signal to exceed the variance,
+enough trials to see past it, and the spread reported next to the mean.
 
-For comparison, the centralized baseline averaged ~2,337 MB/s with one downloader
-and ~1,912 MB/s with two. **It still wins in absolute terms at 16 MB, by roughly
-5×**, for three reasons worth being explicit about: all peers share one disk and
+For comparison, the centralized baseline averaged ~2,638 MB/s with one downloader
+and ~1,885 MB/s with two. **It still wins in absolute terms at 16 MB, by roughly
+6×**, for three reasons worth being explicit about: all peers share one disk and
 one set of cores, so the swarm cannot contribute independent bandwidth; the
 baseline does a single sequential read with no chunking and no hashing, so it pays
 none of the per-piece integrity cost; and there is no network latency on loopback,
@@ -496,8 +535,12 @@ Honest about what this does and does not do:
 - **Single-machine testing only.** Everything runs over `127.0.0.1`, so no result
   here reflects real network latency, packet loss or NIC contention. No NAT
   traversal or DHT.
-- **Fixed 512 KiB piece size** regardless of file size, and filenames containing
-  spaces break the whitespace tokenizer.
+- **Fixed 512 KiB piece size** regardless of file size. A 2 MB file is only four
+  pieces, which leaves little for multi-peer parallelism to work with.
+- **Group and user names still cannot contain whitespace.** Only filenames are
+  percent-encoded; a group id or username with a space would be split into two
+  tokens. The encoding helpers would extend to those fields unchanged, it has
+  just not been done.
 
 ---
 

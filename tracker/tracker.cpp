@@ -711,6 +711,60 @@ void admin_console_thread()
     }
 }
 
+// ---------------- filename encoding on the wire ----------------
+//
+// Commands, sync records and journal lines are all whitespace-split, so a
+// filename containing a space used to be torn into two fields. Filenames travel
+// percent-encoded and are decoded the moment they are parsed; in memory, and in
+// anything shown to a user, a filename is always the real decoded name.
+//
+// Only '%' and characters that would break tokenisation or line framing are
+// escaped, and decoding only treats '%' plus two valid hex digits as an escape -
+// so a name that was never encoded decodes to itself, which keeps journals
+// written before this change replayable.
+
+// Encodes a filename for transmission. Mirrors wire_encode() in client.cpp;
+// the two must stay in step.
+static string wire_encode(const string &s)
+{
+    static const char *HEX = "0123456789ABCDEF";
+    string out;
+    out.reserve(s.size());
+    for (unsigned char c : s)
+    {
+        if (c == '%' || c == ' ' || c == '\t' || c == '\r' || c == '\n' || c < 0x20)
+        {
+            out += '%';
+            out += HEX[c >> 4];
+            out += HEX[c & 0x0F];
+        }
+        else
+            out += (char)c;
+    }
+    return out;
+}
+
+static string wire_decode(const string &s)
+{
+    string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (s[i] == '%' && i + 2 < s.size())
+        {
+            int hi = hexval(s[i + 1]), lo = hexval(s[i + 2]);
+            if (hi >= 0 && lo >= 0)
+            {
+                out += (char)((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+        }
+        out += s[i];
+    }
+    return out;
+}
+
 static vector<string> split_tokens(const string &line)
 {
     vector<string> out;
@@ -1192,7 +1246,7 @@ string apply_leave_group(const string &gid, const string &uid, bool from_sync)
             send_line(pfd, line);
         for (const string &fname : stopped_files)
         {
-            string s = "SYNC_STOP_SHARE " + gid + " " + uid + " " + fname;
+            string s = "SYNC_STOP_SHARE " + gid + " " + uid + " " + wire_encode(fname);
             append_journal_line_if_new(s);
             for (int pfd : peer_fds)
                 send_line(pfd, s);
@@ -1330,7 +1384,7 @@ void handle_get_manifest(int fd, const vector<string> &args)
         send_line(fd, "ERR missing_args");
         return;
     }
-    string gid = args[1], fname = args[2];
+    string gid = args[1], fname = wire_decode(args[2]);
 
     // require login
     string cur = get_user_for_fd(fd);
@@ -1404,7 +1458,7 @@ void handle_upload_file(int fd, const vector<string> &args)
         return;
     }
     string gid = args[1];
-    string fname = args[2];
+    string fname = wire_decode(args[2]);
     string cur = get_user_for_fd(fd);
     if (cur.empty())
     {
@@ -1515,7 +1569,7 @@ void handle_upload_file(int fd, const vector<string> &args)
 
     // journal and broadcast
     ostringstream oss;
-    oss << "SYNC_UPLOAD_FILE " << gid << " " << cur << " " << fname << " "
+    oss << "SYNC_UPLOAD_FILE " << gid << " " << cur << " " << wire_encode(fname) << " "
         << filesize << " " << full_sha1 << " " << piece_sha1s.size() << " " << peer_token;
     for (auto &h : piece_sha1s)
         oss << " " << h;
@@ -1571,7 +1625,7 @@ void handle_list_files(int fd, const vector<string> &args)
         if (!first)
             out += ",";
         first = false;
-        out += f.filename;
+        out += wire_encode(f.filename);
     }
     send_line(fd, out);
 }
@@ -1583,7 +1637,7 @@ void handle_download_file(int fd, const vector<string> &args)
         send_line(fd, "ERR missing_args");
         return;
     }
-    string gid = args[1], fname = args[2], dest = args[3];
+    string gid = args[1], fname = wire_decode(args[2]), dest = args[3];
 
     // require login
     string cur = get_user_for_fd(fd);
@@ -1652,7 +1706,7 @@ void handle_stop_share(int fd, const vector<string> &args)
         send_line(fd, "ERR missing_args");
         return;
     }
-    string gid = args[1], fname = args[2];
+    string gid = args[1], fname = wire_decode(args[2]);
     string cur = get_user_for_fd(fd);
     if (cur.empty())
     {
@@ -1692,7 +1746,7 @@ void handle_stop_share(int fd, const vector<string> &args)
         return;
     }
 
-    string line = "SYNC_STOP_SHARE " + gid + " " + cur + " " + fname;
+    string line = "SYNC_STOP_SHARE " + gid + " " + cur + " " + wire_encode(fname);
     append_journal_line_if_new(line);
     lock_guard<mutex> lg(peer_fds_mtx);
     for (int pfd : peer_fds)
@@ -1778,7 +1832,7 @@ void handle_sync_line(const string &line)
     {
         if (toks.size() >= 4)
         {
-            string gid = toks[1], owner = toks[2], fname = toks[3];
+            string gid = toks[1], owner = toks[2], fname = wire_decode(toks[3]);
             lock_guard<mutex> lg(group_files_mtx);
             auto it = group_files.find(gid);
             if (it != group_files.end())
@@ -1815,7 +1869,7 @@ void handle_sync_line(const string &line)
         // SYNC_UPLOAD_FILE <gid> <owner> <fname> <filesize> <fullsha1> <num_pieces> <peer_token> <piece1> ...
         if (toks.size() >= 7)
         {
-            string gid = toks[1], owner = toks[2], fname = toks[3];
+            string gid = toks[1], owner = toks[2], fname = wire_decode(toks[3]);
             uint64_t filesize = 0;
             try
             {

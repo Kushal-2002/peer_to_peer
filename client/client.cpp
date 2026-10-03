@@ -62,6 +62,79 @@ string current_user;
 // during login, and never retained.
 string current_token;
 
+// ---------------- filename encoding on the wire ----------------
+//
+// Every protocol here is newline-delimited text split on whitespace, so a
+// filename containing a space was torn into two fields and the command failed.
+// Filenames are therefore percent-encoded whenever they go onto any wire - the
+// tracker protocol, the sync records, the journal and the peer protocol - which
+// keeps each one a single whitespace-free token. Nothing above these helpers had
+// to change: the tokenizers and every handler signature stay as they were.
+//
+// In memory a filename is always the real, decoded name; it is encoded only at
+// the moment it is written to a socket and decoded immediately on receipt.
+//
+// A true length-prefixed binary framing would also solve this, and would handle
+// arbitrary bytes without an escape character, but it would mean parsing every
+// message field by field instead of splitting the line - rewriting every handler
+// rather than two helpers.
+
+static int wire_hexval(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+// Encodes '%' plus anything that would break whitespace tokenisation or line
+// framing. Everything else is left readable, so the protocol stays debuggable.
+static string wire_encode(const string &s)
+{
+    static const char *HEX = "0123456789ABCDEF";
+    string out;
+    out.reserve(s.size());
+    for (unsigned char c : s)
+    {
+        if (c == '%' || c == ' ' || c == '\t' || c == '\r' || c == '\n' || c < 0x20)
+        {
+            out += '%';
+            out += HEX[c >> 4];
+            out += HEX[c & 0x0F];
+        }
+        else
+            out += (char)c;
+    }
+    return out;
+}
+
+// Only a '%' followed by two valid hex digits is treated as an escape, so a
+// name that was never encoded decodes to itself. That keeps journals written
+// before this change replayable.
+static string wire_decode(const string &s)
+{
+    string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (s[i] == '%' && i + 2 < s.size())
+        {
+            int hi = wire_hexval(s[i + 1]), lo = wire_hexval(s[i + 2]);
+            if (hi >= 0 && lo >= 0)
+            {
+                out += (char)((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+        }
+        out += s[i];
+    }
+    return out;
+}
+
 mutex current_user_mtx;
 
 unordered_map<string, string> shared_files; // filename -> full path
@@ -482,6 +555,9 @@ void peer_connection_handler(int cfd)
                 owner = "-";
                 filename = token1;
             }
+            // Arrives percent-encoded so a name with spaces survives the
+            // whitespace split above; every lookup below wants the real name.
+            filename = wire_decode(filename);
 
             // An in-progress download takes priority: we hold only part of it,
             // so answer with the exact set of pieces rather than claiming all.
@@ -570,6 +646,7 @@ void peer_connection_handler(int cfd)
                 send_line(cfd, "ERR bad_index");
                 continue;
             }
+            filename = wire_decode(filename); // same reason as QUERY_HAVE
             size_t piece_idx = (size_t)idxll;
 
             // Serve out of an in-progress download's .part file, but only for
@@ -1070,9 +1147,9 @@ bool download_manager_multipeer(const vector<string> &peer_entries,
         // send QUERY_HAVE
         ostringstream q;
         if (!p->owner.empty())
-            q << "QUERY_HAVE " << p->owner << " " << filename;
+            q << "QUERY_HAVE " << p->owner << " " << wire_encode(filename);
         else
-            q << "QUERY_HAVE " << filename;
+            q << "QUERY_HAVE " << wire_encode(filename);
         if (!send_line(s, q.str()))
         {
             close(s);
@@ -1322,9 +1399,9 @@ bool download_manager_multipeer(const vector<string> &peer_entries,
                                       // send REQUEST_PIECE
                                       ostringstream req;
                                       if (!peer->owner.empty())
-                                          req << "REQUEST_PIECE " << peer->owner << " " << filename << " " << piece_idx;
+                                          req << "REQUEST_PIECE " << peer->owner << " " << wire_encode(filename) << " " << piece_idx;
                                       else
-                                          req << "REQUEST_PIECE " << filename << " " << piece_idx;
+                                          req << "REQUEST_PIECE " << wire_encode(filename) << " " << piece_idx;
                                       if (!send_line(s, req.str()))
                                       {
                                           close(s);
@@ -1744,6 +1821,76 @@ static bool tracker_announce(const vector<string> &trackers, int start_idx,
     return rep.rfind("OK", 0) == 0;
 }
 
+// Decodes the filenames in a tracker reply for display. Only replies that
+// actually carry filenames are touched, and each whitespace-separated token is
+// decoded on its own - list_files returns several names separated by spaces, so
+// decoding the line as a whole would run them together.
+static string decode_reply_filenames(const string &cmd, const string &reply)
+{
+    if (cmd != "list_files" && cmd != "upload_file")
+        return reply;
+    if (reply.rfind("OK", 0) != 0)
+        return reply; // error strings carry no filename
+
+    istringstream is(reply);
+    string word;
+    ostringstream out;
+    bool first = true;
+    while (is >> word)
+    {
+        if (!first)
+            out << " ";
+        // "OK" and the "(no_files)" placeholder are not filenames, but decoding
+        // them is harmless since neither contains a %-escape.
+        out << wire_decode(word);
+        first = false;
+    }
+    return out.str();
+}
+
+// Splits a line the user typed into arguments, honouring double quotes and a
+// backslash escape, so a path with spaces can be entered as "my file.bin" or
+// my\ file.bin. Plain whitespace splitting is kept for everything unquoted, so
+// existing usage is unaffected.
+static vector<string> split_command_line(const string &line)
+{
+    vector<string> out;
+    string cur;
+    bool in_quotes = false, have_token = false;
+
+    for (size_t i = 0; i < line.size(); ++i)
+    {
+        char c = line[i];
+        if (c == '\\' && i + 1 < line.size())
+        {
+            cur += line[++i]; // take the next character literally
+            have_token = true;
+            continue;
+        }
+        if (c == '"')
+        {
+            in_quotes = !in_quotes;
+            have_token = true; // "" is a legitimate empty argument
+            continue;
+        }
+        if (!in_quotes && (c == ' ' || c == '\t'))
+        {
+            if (have_token)
+            {
+                out.push_back(cur);
+                cur.clear();
+                have_token = false;
+            }
+            continue;
+        }
+        cur += c;
+        have_token = true;
+    }
+    if (have_token)
+        out.push_back(cur);
+    return out;
+}
+
 static inline string trim_copy(const string &s)
 {
     size_t a = s.find_first_not_of(" \t\r\n");
@@ -1918,12 +2065,9 @@ int main(int argc, char **argv)
         if (line == "quit" || line == "exit")
             break;
 
-        // Quick tokenization (whitespace). NOTE: file paths must NOT contain spaces here.
-        istringstream iss0(line);
-        vector<string> tokens;
-        string tk;
-        while (iss0 >> tk)
-            tokens.push_back(tk);
+        // Quote-aware: a path containing spaces can be given as "my file.bin",
+        // which plain whitespace splitting would have torn into two arguments.
+        vector<string> tokens = split_command_line(line);
         
         if (!tokens.empty() && tokens[0] == "show_seeders") {
             if (tokens.size() < 3) {
@@ -1933,7 +2077,7 @@ int main(int argc, char **argv)
             string gid = tokens[1];
             string fname = tokens[2];
             // Ask tracker for manifest (we only care about peer list part)
-            string cmd = "get_manifest " + gid + " " + fname;
+            string cmd = "get_manifest " + gid + " " + wire_encode(fname);
             if (!send_line(sock, cmd)) {
                 cout << "ERR tracker_send_failed\n";
                 continue;
@@ -2005,7 +2149,7 @@ int main(int argc, char **argv)
             // upload_file <group_id> <filename> <filesize> <full_sha1_hex> <num_pieces> <piece1> <piece2> ...
             string peer_token = (my_peer_port > 0) ? my_peer_addr : "-";
             ostringstream upl;
-            upl << "upload_file " << gid << " " << fname << " " << filesize << " " << fullsha1 << " " << piece_sha1s.size()
+            upl << "upload_file " << gid << " " << wire_encode(fname) << " " << filesize << " " << fullsha1 << " " << piece_sha1s.size()
                 << " " << peer_token;
             for (auto &ph : piece_sha1s)
                 upl << " " << ph;
@@ -2040,7 +2184,7 @@ int main(int argc, char **argv)
                 cout << "Connected to tracker: " << trackers[connected_idx] << "\n";
             }
 
-            string cmd = "stop_share " + gid + " " + fname;
+            string cmd = "stop_share " + gid + " " + wire_encode(fname);
             if (!send_line(sock, cmd)) {
                 conn_close(sock); sock = -1;
                 cout << "ERR tracker_send_failed\n";
@@ -2130,7 +2274,7 @@ int main(int argc, char **argv)
             string gid = tokens[1], fname = tokens[2], destpath = tokens[3];
 
             // ask tracker for manifest (synchronous here, so we can fail fast)
-            string getm = "get_manifest " + gid + " " + fname;
+            string getm = "get_manifest " + gid + " " + wire_encode(fname);
             if (!send_line(sock, getm))
             {
                 cerr << "tracker send failed\n";
@@ -2192,7 +2336,7 @@ int main(int argc, char **argv)
             // into asking us for a piece we do not hold yet.
             {
                 ostringstream ann;
-                ann << "upload_file " << gid << " " << fname << " " << filesize
+                ann << "upload_file " << gid << " " << wire_encode(fname) << " " << filesize
                     << " " << fullsha1 << " " << piece_hashes.size()
                     << " " << my_peer_addr;
                 for (auto &ph : piece_hashes)
@@ -2260,7 +2404,7 @@ int main(int argc, char **argv)
                         // withdraw that now. Leaving the entry behind would send
                         // other peers to an address holding nothing.
                         tracker_announce(trackers_copy, last_try_copy,
-                                         "stop_share " + gid_copy + " " + fname_copy);
+                                         "stop_share " + gid_copy + " " + wire_encode(fname_copy));
                         job->status.store(DLStatus::FAILED);
                         job->error_msg = "download_failed";
                         return;
@@ -2288,7 +2432,7 @@ int main(int argc, char **argv)
 
                         // build upload manifest line
                         ostringstream upl;
-                        upl << "upload_file " << gid_copy << " " << fname_copy << " "
+                        upl << "upload_file " << gid_copy << " " << wire_encode(fname_copy) << " "
                             << new_filesize << " " << new_fullsha1 << " " << new_piece_sha1s.size()
                             << " " << my_peer_addr_copy;
                         for (auto &ph : new_piece_sha1s) upl << " " << ph;
@@ -2438,8 +2582,11 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            // print the response
-            cout << resp << "\n";
+            // print the response, decoding any filenames it carries so the user
+            // sees "my holiday video.mp4" rather than "my%20holiday%20video.mp4".
+            // Decoded per token, because list_files returns several filenames
+            // separated by spaces - decoding the whole line would merge them.
+            cout << decode_reply_filenames(tokens.empty() ? string() : tokens[0], resp) << "\n";
 
             // after: cout << resp << "\n";
             if (line.rfind("upload_file ", 0) == 0 && resp.rfind("OK", 0) == 0) {
