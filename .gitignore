@@ -41,3 +41,6 @@ __pycache__/
 .demo/
 tests/test_journal
 tests/__pycache__/
+
+# test runner scratch output
+/tmp_test_out/

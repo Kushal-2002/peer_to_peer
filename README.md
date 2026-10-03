@@ -539,6 +539,18 @@ contains the command dispatcher, the journal, and the replication threads.
 ## Tests
 
 ```bash
+./run-tests.sh            # build + both suites + benchmark
+./run-tests.sh --quick    # skip the benchmark (which takes minutes)
+```
+
+One command re-verifies everything, so there is never a reason to rely on a
+stale note about what passed last time. [`FINDINGS.md`](FINDINGS.md) is the
+durable record: every bug found, whether it is fixed, which test pins it, and
+what is still open.
+
+To build and run a suite directly:
+
+```bash
 # Linux
 g++ -std=gnu++17 -O2 -Wall -Wextra tests/test_journal.cpp \
     -o tests/test_journal -pthread -lssl -lcrypto && ./tests/test_journal
