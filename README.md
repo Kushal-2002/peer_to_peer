@@ -152,8 +152,13 @@ routine operation.
 Login now returns a signed token:
 
 ```
-v1:<username-hex>:<expiry-unix>:<hmac-sha256-hex>
+v1:<username-hex>:<expiry-unix>:<nonce-hex>:<hmac-sha256-hex>
 ```
+
+The nonce is what makes each token unique. Without it the payload is only
+username plus expiry, so logging out and immediately back in within the same
+second mints a byte-identical token — one the logout had just added to the
+revocation set, leaving the new session holding a token the tracker refuses.
 
 The token is **stateless**. It carries the username and an expiry, authenticated
 by an HMAC over both using a secret shared by every tracker (`session.key`,
@@ -377,40 +382,47 @@ scaling (fixed seeders, concurrent downloaders), and a centralized single-source
 TCP baseline written inside the harness for comparison. Results print and are
 written to `results.csv`.
 
-### Measured — 16 MB file, 6 trials averaged, loopback, single machine
+### Measured — 16 MB file, 6 trials each, loopback, single machine
 
-Peer scaling, one downloader:
+Peer scaling, one downloader. Every figure below is recomputable from the
+committed `results.csv`:
 
-| Seeders | Mean | Range | vs. 1 seeder |
-|---|---|---|---|
-| 1 | 241.75 MB/s | 219.8 – 259.7 | — |
-| 2 | 431.37 MB/s | 423.7 – 444.1 | **1.78×** |
-| 4 | 429.14 MB/s | 422.4 – 444.2 | 1.78× (no further gain) |
+| Seeders | Mean | Range | Spread | vs. 1 seeder |
+|---|---|---|---|---|
+| 1 | 246.00 MB/s | 217.4 – 260.1 | 17% | — |
+| 2 | 419.31 MB/s | 335.7 – 449.1 | 27% | **1.70×** |
+| 4 | 414.43 MB/s | 321.9 – 454.1 | 32% | 1.68× |
 
-**A second seeder makes the download 1.78× faster.** A third and fourth add
-nothing: on a single machine every seeder reads the same file from the same disk,
-so two are enough to saturate it and the bottleneck moves from peer availability
-onto that device. On separate hosts with independent disks the curve would be
-expected to keep rising.
+**A second seeder makes the download roughly 1.7× faster.** A third and fourth
+add nothing: on a single machine every seeder reads the same file from the same
+disk, so two are enough to saturate it and the bottleneck moves from peer
+availability onto that device. On separate hosts with independent disks the curve
+would be expected to keep rising.
 
-A note on methodology, because it changed the answer twice. An early measurement
-at 2 MB in a single trial suggested 1.5×; at that size the file is four pieces and
-the transfer takes under 30 ms, so run-to-run variance exceeds the effect, and a
-later single trial at the same size showed two seeders as marginally *slower*.
-Moving to 16 MB and three trials gave 1.45×, then six trials gave 1.78× — the
-three-trial sample had caught a low outlier. The spread above shows why: the
-one-seeder figure varies by 16.5% run to run while the two-seeder figure varies by
-under 5%, so the single-source case is the noisy one and needs the most repeats.
-Any scaling claim here needs both a large enough file and enough trials to see
-past that.
+The spread column is there on purpose — it is 17–32%, which is large, so treat
+1.7× as approximate rather than precise. Measuring this honestly took three
+attempts and the answer moved each time:
 
-For comparison, the centralized baseline reached ~2,600 MB/s with one downloader
-and ~1,800 MB/s with two. **It still wins in absolute terms at 16 MB, by roughly
-6×**, for three reasons worth being explicit about: all peers share one disk and
+| Attempt | Setup | Result |
+|---|---|---|
+| 1 | 2 MB, 1 trial | 1.5× — pure noise; a repeat run showed 2 seeders *slower* |
+| 2 | 16 MB, 3 trials | 1.45× — sample caught a low outlier |
+| 3 | 16 MB, 6 trials | **1.70×** — with the variance above now visible |
+
+At 2 MB the file is four pieces and the transfer takes under 30 ms, so run-to-run
+variance swamps the effect entirely. Even at 16 MB the single-seeder case varies
+17% between runs. The lesson, which matters more than the number: a scaling claim
+needs a file large enough for the signal to exceed the variance, enough trials to
+see past it, and the spread reported alongside the mean.
+
+For comparison, the centralized baseline averaged ~2,337 MB/s with one downloader
+and ~1,912 MB/s with two. **It still wins in absolute terms at 16 MB, by roughly
+5×**, for three reasons worth being explicit about: all peers share one disk and
 one set of cores, so the swarm cannot contribute independent bandwidth; the
 baseline does a single sequential read with no chunking and no hashing, so it pays
 none of the per-piece integrity cost; and there is no network latency on loopback,
-which is precisely the cost that multi-peer parallelism exists to hide.
+which is precisely the cost that multi-peer parallelism exists to hide. The test
+environment flatters the baseline.
 
 **The file size at which P2P overtakes the centralized baseline has not been
 measured** — it was not reached at 16 MB. Finding it requires a much larger file

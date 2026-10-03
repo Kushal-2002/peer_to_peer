@@ -2382,6 +2382,7 @@ int main(int argc, char **argv)
 
         // detect login command to save credentials on success (unchanged behavior)
         bool is_login = false;
+        bool is_logout = false;
         string login_user, login_pass;
         {
             istringstream iss(line);
@@ -2392,6 +2393,8 @@ int main(int argc, char **argv)
                 is_login = true;
                 iss >> login_user >> login_pass;
             }
+            else if (w == "logout")
+                is_logout = true;
         }
 
         // Attempt send+recv, with simple reconnect logic on failure
@@ -2495,6 +2498,21 @@ int main(int argc, char **argv)
                     }
                     logged_in = false;
                 }
+            }
+
+            // Logout has to clear local session state too. The tracker drops
+            // the session and revokes the token, but without this the client
+            // would keep holding a dead token and still believe it was signed
+            // in, so its own "not logged in" guards would never fire.
+            if (is_logout && resp.rfind("OK", 0) == 0)
+            {
+                {
+                    lock_guard<mutex> lg(current_user_mtx);
+                    current_user.clear();
+                    current_token.clear();
+                }
+                logged_in = false;
+                cout << "[info] logged out; session token discarded.\n";
             }
 
             done = true;

@@ -385,8 +385,19 @@ static string make_session_token(const string &uid)
 {
     if (g_session_secret.empty())
         return string();
+
+    // A random nonce makes every token unique even for the same user in the
+    // same second. Without it the payload is just username+expiry, so logging
+    // out and straight back in would mint a byte-identical token - one that the
+    // logout had already added to the revocation set, leaving the new session
+    // holding a token the tracker refuses.
+    unsigned char nonce[12];
+    if (RAND_bytes(nonce, (int)sizeof(nonce)) != 1)
+        return string();
+
     string payload = "v1:" + to_hex((const unsigned char *)uid.data(), uid.size()) +
-                     ":" + to_string((long)time(nullptr) + SESSION_TTL_SECONDS);
+                     ":" + to_string((long)time(nullptr) + SESSION_TTL_SECONDS) +
+                     ":" + to_hex(nonce, sizeof(nonce));
     string mac = session_hmac(payload);
     if (mac.empty())
         return string();
@@ -415,18 +426,23 @@ static bool verify_session_token(const string &token, string &uid)
     if (CRYPTO_memcmp(expect.data(), mac.data(), expect.size()) != 0)
         return false;
 
-    // payload == v1:<uid-hex>:<expiry>
+    // payload == v1:<uid-hex>:<expiry>:<nonce-hex>
     size_t p1 = payload.find(':');
     if (p1 == string::npos)
         return false;
     size_t p2 = payload.find(':', p1 + 1);
     if (p2 == string::npos)
         return false;
+    size_t p3 = payload.find(':', p2 + 1);
+    if (p3 == string::npos)
+        return false; // nonce is mandatory
     if (payload.compare(0, p1, "v1") != 0)
         return false;
 
     string uid_hex = payload.substr(p1 + 1, p2 - p1 - 1);
-    string exp_str = payload.substr(p2 + 1);
+    string exp_str = payload.substr(p2 + 1, p3 - p2 - 1);
+    // The nonce itself carries no meaning beyond uniqueness; it only has to be
+    // covered by the signature, which it is.
 
     long expiry = 0;
     try
