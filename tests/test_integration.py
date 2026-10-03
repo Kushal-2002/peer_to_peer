@@ -24,7 +24,6 @@ import os
 import re
 import shutil
 import signal
-import subprocess
 import sys
 import tempfile
 import time
@@ -34,7 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "benchmark"))
 
-import bench  # noqa: E402  - reuse its ClientProc, tracker control and helpers
+import bench  # reuse its ClientProc, tracker control and scenario helpers
 
 TRACKER_DIR = os.path.join(ROOT, "tracker")
 CLIENT_DIR = os.path.join(ROOT, "client")
@@ -128,7 +127,7 @@ def t_replication_propagates_writes():
 
             # The user must exist on tracker 1 - logging in there proves the
             # credential replicated, not merely the username.
-            out = wait_until(
+            wait_until(
                 lambda: ("OK logged_in" in b.cmd(f"login {user} pw")) or None,
                 timeout=15, what="user to replicate to tracker 1")
             log(f"logged in as {user} via {addrs[1]}")
@@ -161,7 +160,7 @@ def t_partial_share_seeding():
         fname = os.path.basename(src)
         gid = f"g_{rt}"
 
-        owner, owner_user = bench.setup_owner_seeder(gid, src, rt)
+        owner, _owner_user = bench.setup_owner_seeder(gid, src, rt)
         try:
             mid, mid_user = bench.add_downloader(owner, gid, 1, rt)
             try:
