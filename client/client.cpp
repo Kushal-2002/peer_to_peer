@@ -180,10 +180,55 @@ struct DownloadJob
     atomic<size_t> done_pieces{0};  // pieces completed
     size_t total_pieces = 0;
     atomic<DLStatus> status{DLStatus::QUEUED};
+    // Steady-clock milliseconds, so show_downloads can report a rate. Zero
+    // means "not set yet"; end_ms is stamped once the job leaves RUNNING so a
+    // finished job keeps reporting the rate it actually achieved rather than
+    // one that decays as the process keeps running.
+    atomic<long long> start_ms{0};
+    atomic<long long> end_ms{0};
     string error_msg;
     thread worker; // worker thread (joinable)
     string last_tracker_reply;
 };
+
+// Milliseconds on a monotonic clock, used only for download rate arithmetic.
+static long long steady_ms()
+{
+    return chrono::duration_cast<chrono::milliseconds>(
+               chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// 1536 -> "1.5 KB", 2500000 -> "2.4 MB". Keeps the status line narrow enough to
+// read at a glance.
+static string human_bytes(uint64_t n)
+{
+    const char *unit[] = {"B", "KB", "MB", "GB", "TB"};
+    double v = (double)n;
+    int u = 0;
+    while (v >= 1024.0 && u < 4)
+    {
+        v /= 1024.0;
+        ++u;
+    }
+    ostringstream o;
+    o << fixed << setprecision(u == 0 ? 0 : 1) << v << " " << unit[u];
+    return o.str();
+}
+
+// A fixed-width bar drawn with block characters, so columns line up across rows.
+static string progress_bar(double frac, int width = 18)
+{
+    if (frac < 0.0)
+        frac = 0.0;
+    if (frac > 1.0)
+        frac = 1.0;
+    int filled = (int)(frac * width + 0.5);
+    string bar;
+    for (int i = 0; i < width; ++i)
+        bar += (i < filled) ? "█" : "░"; // full block / light shade
+    return bar;
+}
 
 mutex downloads_mtx;
 unordered_map<string, shared_ptr<DownloadJob>> downloads; // id -> job
@@ -2238,8 +2283,9 @@ int main(int argc, char **argv)
                 for (auto &kv : downloads)
                 {
                     auto j = kv.second;
+                    DLStatus st = j->status.load();
                     char tag = '?';
-                    switch (j->status.load())
+                    switch (st)
                     {
                         case DLStatus::QUEUED:   tag = 'Q'; break;
                         case DLStatus::RUNNING:  tag = 'R'; break;
@@ -2248,8 +2294,43 @@ int main(int argc, char **argv)
                         case DLStatus::CANCELLED:tag = 'X'; break;
                         default:                 tag = '?'; break;
                     }
-                    // print only the concise status line (no tracker reply)
+
+                    // The worker threads already maintain these counters; the
+                    // old status line simply discarded them, which hid the
+                    // multi-peer download entirely while it was happening.
+                    size_t done = j->done_pieces.load();
+                    size_t total = j->total_pieces;
+                    uint64_t got = j->downloaded.load();
+                    double frac = total ? (double)done / (double)total : 0.0;
+                    if (st == DLStatus::SUCCESS)
+                        frac = 1.0;
+
                     cout << "[" << tag << "] [" << j->gid << "] " << j->filename << "\n";
+                    cout << "      " << progress_bar(frac) << " "
+                         << setw(3) << (int)(frac * 100.0 + 0.5) << "%";
+                    if (total)
+                        cout << "   " << done << "/" << total << " pieces";
+                    if (j->total_bytes)
+                        cout << "   " << human_bytes(got) << " / "
+                             << human_bytes(j->total_bytes);
+
+                    // Rate over the job's own elapsed time: live while running,
+                    // frozen at the achieved rate once it has finished.
+                    long long t0 = j->start_ms.load();
+                    long long t1 = j->end_ms.load();
+                    if (t0 > 0)
+                    {
+                        long long now = (t1 > 0) ? t1 : steady_ms();
+                        double secs = (double)(now - t0) / 1000.0;
+                        if (secs > 0.001 && got > 0)
+                        {
+                            double mbps = ((double)got / (1024.0 * 1024.0)) / secs;
+                            cout << "   " << fixed << setprecision(1) << mbps << " MB/s";
+                        }
+                    }
+                    if (st == DLStatus::FAILED && !j->error_msg.empty())
+                        cout << "   (" << j->error_msg << ")";
+                    cout << "\n";
                 }
             }
 
@@ -2266,12 +2347,16 @@ int main(int argc, char **argv)
                 cout << "ERR not_logged_in\n";
                 continue;
             }
-            if (tokens.size() < 4)
+            if (tokens.size() < 3)
             {
-                cout << "ERR missing_args. Usage: download_file <group_id> <filename> <destpath>\n";
+                cout << "ERR missing_args. Usage: download_file <group_id> <filename> [destpath]\n";
                 continue;
             }
-            string gid = tokens[1], fname = tokens[2], destpath = tokens[3];
+            string gid = tokens[1], fname = tokens[2];
+            // The destination is optional: saving into the current directory
+            // under the file's own name is what you want almost every time, and
+            // typing the name twice was the most tedious part of the flow.
+            string destpath = (tokens.size() >= 4) ? tokens[3] : ("./" + fname);
 
             // ask tracker for manifest (synchronous here, so we can fail fast)
             string getm = "get_manifest " + gid + " " + wire_encode(fname);
@@ -2388,6 +2473,7 @@ int main(int argc, char **argv)
                                   destpath_copy]() mutable
                                  {
                 try {
+                    job->start_ms.store(steady_ms());
                     job->status.store(DLStatus::RUNNING);
 
                     // pass job so manager updates progress
@@ -2405,7 +2491,8 @@ int main(int argc, char **argv)
                         // other peers to an address holding nothing.
                         tracker_announce(trackers_copy, last_try_copy,
                                          "stop_share " + gid_copy + " " + wire_encode(fname_copy));
-                        job->status.store(DLStatus::FAILED);
+                    job->end_ms.store(steady_ms());
+                    job->status.store(DLStatus::FAILED);
                         job->error_msg = "download_failed";
                         return;
                     }
@@ -2415,7 +2502,8 @@ int main(int argc, char **argv)
                     string new_fullsha1;
                     vector<string> new_piece_sha1s;
                     if (!compute_piece_and_file_sha1(destpath_copy, new_filesize, new_fullsha1, new_piece_sha1s)) {
-                        job->status.store(DLStatus::FAILED);
+                    job->end_ms.store(steady_ms());
+                    job->status.store(DLStatus::FAILED);
                         job->error_msg = "compute_sha_failed";
                         return;
                     }
@@ -2509,12 +2597,15 @@ int main(int argc, char **argv)
 
 
 
+                    job->end_ms.store(steady_ms());
                     job->status.store(DLStatus::SUCCESS);
                 } catch (const std::exception &e) {
                     job->error_msg = string("exception: ") + e.what();
+                    job->end_ms.store(steady_ms());
                     job->status.store(DLStatus::FAILED);
                 } catch (...) {
                     job->error_msg = "unknown_exception";
+                    job->end_ms.store(steady_ms());
                     job->status.store(DLStatus::FAILED);
                 } });
 

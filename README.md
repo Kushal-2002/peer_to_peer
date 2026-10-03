@@ -6,7 +6,7 @@ downloaded in parallel from multiple peers at once. A replicated metadata tracke
 handles authentication, group membership and peer discovery over TLS — but never
 carries file data.
 
-No external frameworks. ~5,000 lines of C++ across two binaries, plus a Python
+No external frameworks. ~5,100 lines of C++ across two binaries, plus a Python
 benchmark harness that drives the real processes.
 
 ---
@@ -214,6 +214,23 @@ the wire, which is worth keeping.
 
 ---
 
+## Quick start
+
+```bash
+./demo.sh
+```
+
+Builds anything stale, generates the TLS certificate and the token signing
+secret on first run, starts every tracker listed in `tracker_info.txt` on a
+clean journal, copies the trust anchor to `client/`, and prints the client
+commands to paste. `./demo.sh --stop` shuts the trackers down and clears the
+journals; `./demo.sh --rebuild` forces a recompile.
+
+Tracker logs go to `.demo/tracker_<n>.log`. The sections below cover doing all
+of it by hand.
+
+---
+
 ## Build
 
 Both binaries link OpenSSL 3.
@@ -344,9 +361,23 @@ Now Bob can list and fetch:
 > show_downloads
 ```
 
-`show_downloads` prints a status tag per job — `C` complete, `D` downloading,
-`F` failed. Bob begins serving verified pieces to other peers as soon as the
-first one lands.
+`show_downloads` reports progress per job, drawn from counters the worker
+threads already maintain:
+
+```
+[R] [study] my holiday video.mp4
+      ████████████░░░░░░  68%   21/31 pieces   10.6 MB / 15.5 MB   112.4 MB/s
+[C] [study] report.pdf
+      ██████████████████ 100%   4/4 pieces     1.9 MB / 1.9 MB     88.1 MB/s
+```
+
+The tag is `Q` queued, `R` running, `C` complete, `F` failed, `X` cancelled. The
+rate is measured over the job's own elapsed time, so a finished job keeps
+reporting the rate it actually achieved rather than one that decays as the
+process keeps running.
+
+Bob begins serving verified pieces to other peers as soon as the first one
+lands, so a second downloader joining mid-transfer can already fetch from him.
 
 ---
 
@@ -366,8 +397,8 @@ first one lands.
 | `accept_request <gid> <user>` | Approve a request (owner only). |
 | `list_files <gid>` | Files shared in a group. |
 | `upload_file <gid> <file_path>` | Hash the file locally and announce it. Quote paths containing spaces: `upload_file g "my file.bin"`. |
-| `download_file <gid> <filename> <dest>` | Multi-peer parallel download. Quote names containing spaces. |
-| `show_downloads` | Status of all download jobs. |
+| `download_file <gid> <filename> [dest]` | Multi-peer parallel download. Destination defaults to `./<filename>`. Quote names containing spaces. |
+| `show_downloads` | Progress of all download jobs: bar, percentage, pieces, bytes and rate. |
 | `show_seeders <gid> <filename>` | Which peers currently hold the file. |
 | `stop_share <gid> <filename>` | Stop seeding a file. |
 | `quit` / `exit` | Shut down the client. |
@@ -419,44 +450,59 @@ written to `results.csv`.
 
 ### Measured — 16 MB file, 6 trials each, loopback, single machine
 
-Peer scaling, one downloader. Recomputable from the committed `results.csv`:
+Recomputable from the committed `results.csv`. One downloader, varying seeders:
 
-| Seeders | Mean | Range | Spread | vs. 1 seeder |
-|---|---|---|---|---|
-| 1 | 230.79 MB/s | 211.8 – 256.6 | 19% | — |
-| 2 | 432.12 MB/s | 426.3 – 436.8 | 2% | **1.87×** |
-| 4 | 424.32 MB/s | 422.8 – 426.8 | 1% | 1.84× |
+| Seeders | Mean | Range | Spread |
+|---|---|---|---|
+| 1 | 303.23 MB/s | 217.6 – 443.0 | **74%** |
+| 2 | 431.43 MB/s | 421.3 – 454.1 | 8% |
+| 4 | 415.06 MB/s | 375.0 – 424.4 | 12% |
 
-**A second seeder roughly doubles throughput.** A third and fourth add nothing:
-on a single machine every seeder reads the same file from the same disk, so two
-are enough to saturate it and the bottleneck moves from peer availability onto
-that device. On separate hosts with independent disks the curve would be expected
-to keep rising.
+**Two findings are solid, and one is not.**
 
-**The honest figure is 1.7×–1.9×, not a single number.** Repeating the whole
-6-trial sweep gives a different ratio each time — 1.70× on one run, 1.87× on the
-next — and the spread column shows why. The multi-seeder measurements are tight
-(1–2%), but the *single-seeder* baseline varies 19% run to run, and it is the
-denominator. Chasing a precise ratio would mean many more trials against a
-baseline that is inherently noisy on a shared laptop; quoting the range is the
-more defensible claim.
+Solid: a multi-peer download reliably reaches **~430 MB/s**, and that figure is
+stable — 8% spread across six trials. Also solid: **adding a third and fourth
+seeder gains nothing.** On a single machine every seeder reads the same file from
+the same disk, so two saturate it and the bottleneck moves off peer availability
+onto that device. On separate hosts with independent disks the curve would be
+expected to keep rising.
 
-Getting even that far took three attempts:
+Not solid: **the speedup ratio.** The single-seeder baseline varies 74% run to
+run — 217 MB/s on one trial, 443 MB/s on another, which is as fast as two
+seeders managed. Almost certainly the OS page cache: when the source file is
+already resident from an earlier trial the read runs at memory speed, and with
+one seeder that dominates the measurement, while with two or more the
+parallelism masks it.
 
-| Attempt | Setup | Result |
+Because the baseline is the denominator, repeating the whole six-trial sweep
+produced a different ratio every time:
+
+| Run | Ratio | 1-seeder baseline |
 |---|---|---|
-| 1 | 2 MB, 1 trial | 1.5× — pure noise. A repeat showed 2 seeders *slower* than 1. |
+| A | 1.70× | 246 MB/s |
+| B | 1.87× | 231 MB/s |
+| C | 1.42× | 303 MB/s |
+
+So **no speedup figure is quoted here**, and that is the correct conclusion
+rather than a gap. Pinning the ratio down would need the page cache controlled
+between trials and ideally separate hosts, which this setup cannot provide.
+Quoting any single one of those three numbers would be picking a favourite.
+
+Getting to that conclusion took four attempts:
+
+| Attempt | Setup | Outcome |
+|---|---|---|
+| 1 | 2 MB, 1 trial | 1.5× — noise. A repeat showed 2 seeders *slower* than 1. |
 | 2 | 16 MB, 3 trials | 1.45× — the sample caught a low outlier. |
-| 3 | 16 MB, 6 trials, repeated | **1.7×–1.9×**, with the variance finally visible. |
+| 3 | 16 MB, 6 trials | 1.70×, then 1.87× on a repeat. |
+| 4 | 16 MB, 6 trials, spread examined | Baseline varies 74%; the ratio is not measurable here. |
 
-At 2 MB the file is four pieces and the transfer takes under 30 ms, so run-to-run
-variance swamps the effect entirely. The lesson matters more than the number: a
-scaling claim needs a file large enough for the signal to exceed the variance,
-enough trials to see past it, and the spread reported next to the mean.
+The lesson is worth more than the number: report the spread alongside the mean,
+and when the spread swamps the effect, say so instead of quoting the mean.
 
-For comparison, the centralized baseline averaged ~2,638 MB/s with one downloader
-and ~1,885 MB/s with two. **It still wins in absolute terms at 16 MB, by roughly
-6×**, for three reasons worth being explicit about: all peers share one disk and
+For comparison, the centralized baseline averaged ~3,059 MB/s with one downloader
+and ~2,133 MB/s with two. **It still wins in absolute terms at 16 MB, by roughly
+7×**, for three reasons worth being explicit about: all peers share one disk and
 one set of cores, so the swarm cannot contribute independent bandwidth; the
 baseline does a single sequential read with no chunking and no hashing, so it pays
 none of the per-piece integrity cost; and there is no network latency on loopback,

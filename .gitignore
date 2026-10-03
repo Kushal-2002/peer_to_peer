@@ -36,3 +36,6 @@ PROJECT_REPORT.tex
 .vscode/
 __pycache__/
 *.pyc
+
+# demo launcher runtime state
+.demo/
